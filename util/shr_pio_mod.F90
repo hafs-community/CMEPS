@@ -148,16 +148,19 @@ contains
 !<
 
 
-  subroutine shr_pio_init2(comp_id, comp_name, comp_iamin, comp_comm, comp_comm_iam)
+  subroutine shr_pio_init2(comp_id, comp_name, comp_iamin, comp_comm, comp_comm_iam, comp_with_pio)
 
     integer          , intent(in) :: comp_id(:)
     logical          , intent(in) :: comp_iamin(:)
     character(len=*) , intent(in) :: comp_name(:)
     integer          , intent(in) :: comp_comm(:), comp_comm_iam(:)
+    logical          , optional, intent(in) :: comp_with_pio(:)
+    !logical          , intent(in) :: comp_with_pio(:)
 
     integer                    :: i
     character(len=shr_kind_cl) :: nlfilename, cname
     integer                    :: ret
+    logical                    :: uses_pio
     character(*), parameter :: subName = '(shr_pio_init2) '
 
     if(pio_debug_level>0) then
@@ -206,13 +209,27 @@ contains
 !       i=1
     else
        do i=1,total_comps
-          if(comp_iamin(i)) then
+          ! selectively turn on/off support for particular component
+          uses_pio = .true.
+          if (present(comp_with_pio)) then
+             uses_pio = comp_with_pio(i)
+          end if
+
+          if(comp_iamin(i) .and. uses_pio) then
              cname = comp_name(i)
              if(len_trim(cname) <= 3) then
                 nlfilename=trim(ESMF_UtilStringLowerCase(cname))//'_modelio.nml'
              else
                 nlfilename=trim(ESMF_UtilStringLowerCase(cname(1:3)))//'_modelio.nml_'//cname(4:8)
              endif
+
+             print*, "cname, i = ", trim(cname), i
+             print*, "pio_comp_settings(i)%pio_stride = ", pio_comp_settings(i)%pio_stride
+             print*, "pio_comp_settings(i)%pio_root = ", pio_comp_settings(i)%pio_root
+             print*, "pio_comp_settings(i)%pio_numiotasks = ", pio_comp_settings(i)%pio_numiotasks
+             print*, "pio_comp_settings(i)%pio_iotype = ", pio_comp_settings(i)%pio_iotype
+             print*, "pio_comp_settings(i)%pio_rearranger = ", pio_comp_settings(i)%pio_rearranger
+             print*, "pio_comp_settings(i)%pio_netcdf_ioformat = ", pio_comp_settings(i)%pio_netcdf_ioformat
 
              call shr_pio_read_component_namelist(nlfilename , comp_comm(i), pio_comp_settings(i)%pio_stride, &
                   pio_comp_settings(i)%pio_root, pio_comp_settings(i)%pio_numiotasks, &
@@ -235,7 +252,13 @@ contains
        end do
     end if
     do i=1,total_comps
-       if(comp_iamin(i) .and. (comp_comm_iam(i) == 0)) then
+       ! selectively turn on/off support for particular component
+       uses_pio = .true.
+       if (present(comp_with_pio)) then
+          uses_pio = comp_with_pio(i)
+       end if
+
+       if(comp_iamin(i) .and. (comp_comm_iam(i) == 0) .and. uses_pio) then
           write(shr_log_unit,*) io_compname(i),' : pio_numiotasks = ',pio_comp_settings(i)%pio_numiotasks
           write(shr_log_unit,*) io_compname(i),' : pio_stride = ',pio_comp_settings(i)%pio_stride
           write(shr_log_unit,*) io_compname(i),' : pio_rearranger = ',pio_comp_settings(i)%pio_rearranger
@@ -352,6 +375,7 @@ contains
 
      index = -1
      do i=1,total_comps
+        print*, "io_compid = ", io_compid(i), "compid = ", compid
         if(io_compid(i)==compid) then
           index = i
           exit
