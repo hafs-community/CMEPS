@@ -56,8 +56,9 @@ module esmflds
   integer , public, parameter :: map_glc2ocn_liq   = 13 ! custom smoothing map to map liq from glc->ocn (cesm only)
   integer , public, parameter :: map_glc2ocn_ice   = 14 ! custom smoothing map to map ice from glc->ocn (cesm only)
   integer , public, parameter :: mapfillv_bilnr    = 15 ! fill value followed by bilinear
-  integer , public, parameter :: mapbilnr_nstod    = 16 ! bilinear with nstod extrapolation
-  integer , public, parameter :: nmappers          = 16
+  integer , public, parameter :: mapfillv_consf    = 16 ! fill value vollowed by conservative frac
+  integer , public, parameter :: mapbilnr_nstod    = 17 ! bilinear with nstod extrapolation
+  integer , public, parameter :: nmappers          = 17
 
   character(len=*) , public, parameter :: mapnames(nmappers) = &
        (/'bilnr      ',&
@@ -75,6 +76,7 @@ module esmflds
          'glc2ocn_ice',&
          'glc2ocn_liq',&
          'fillv_bilnr',&
+         'fillv_consf',&
          'bilnr_nstod'/)
 
   !-----------------------------------------------

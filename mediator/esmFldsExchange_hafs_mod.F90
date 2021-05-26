@@ -470,7 +470,7 @@ contains
     use esmFlds               , only : addmrg => med_fldList_AddMrg
     use esmflds               , only : mapbilnr, mapconsf, mapconsd, mappatch
     use esmflds               , only : mapfcopy, mapnstod, mapnstod_consd
-    use esmflds               , only : mapfillv_bilnr
+    use esmflds               , only : mapfillv_bilnr, mapfillv_consf
     use esmflds               , only : mapnstod_consf
 
     ! input/output parameters:
@@ -883,7 +883,7 @@ contains
               fldchk(is_local%wrap%FBImp(compatm,compatm),trim(fldname1),rc=rc) &
             ) then
              call addmap(fldListFr(compatm)%flds, trim(fldname1), compocn, &
-                  mapfillv_bilnr, hafs_attr%mapnorm, hafs_attr%atm2ocn_smap)
+                  mapfillv_consf, hafs_attr%mapnorm, hafs_attr%atm2ocn_smap)
              call addmrg(fldListTo(compocn)%flds, trim(fldname2), &
                   mrg_from=compatm, mrg_fld=trim(fldname1), mrg_type='copy')
           end if

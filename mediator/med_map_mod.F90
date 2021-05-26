@@ -219,7 +219,7 @@ contains
     use esmFlds           , only : mapbilnr, mapconsf, mapconsd, mappatch, mappatch_uv3d, mapbilnr_uv3d, mapfcopy
     use esmFlds           , only : mapunset, mapnames, nmappers
     use esmFlds           , only : mapnstod, mapnstod_consd, mapnstod_consf, mapnstod_consd
-    use esmFlds           , only : mapfillv_bilnr, mapbilnr_nstod
+    use esmFlds           , only : mapfillv_bilnr, mapfillv_consf, mapbilnr_nstod
     use esmFlds           , only : ncomps, compatm, compice, compocn, compname
     use esmFlds           , only : coupling_mode, dststatus_print
     use esmFlds           , only : atm_name
@@ -325,7 +325,7 @@ contains
             ignoreUnmatchedIndices=.true., &
             srcTermProcessing=srcTermProcessing_Value, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-    else if (mapindex == mapbilnr .or. mapindex == mapbilnr_uv3d) then
+    else if (mapindex == mapbilnr .or. mapindex == mapbilnr_uv3d .or. mapindex == mapfillv_bilnr) then
        if (.not. ESMF_RouteHandleIsCreated(routehandles(mapbilnr))) then
           if (mastertask) then
              write(logunit,'(A)') trim(subname)//' creating RH '//trim(mapname)//' for '//trim(string)
@@ -341,20 +341,6 @@ contains
                unmappedaction=ESMF_UNMAPPEDACTION_IGNORE, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
        end if
-    else if (mapindex == mapfillv_bilnr) then
-       if (mastertask) then
-          write(logunit,'(A)') trim(subname)//' creating RH '//trim(mapname)//' for '//trim(string)
-       end if
-       call ESMF_FieldRegridStore(fldsrc, flddst, routehandle=routehandles(mapfillv_bilnr), &
-            srcMaskValues=(/srcMaskValue/), &
-            dstMaskValues=(/dstMaskValue/), &
-            regridmethod=ESMF_REGRIDMETHOD_BILINEAR, &
-            polemethod=polemethod, &
-            srcTermProcessing=srcTermProcessing_Value, &
-            ignoreDegenerate=.true., &
-            dstStatusField=dststatusfield, &
-            unmappedaction=ESMF_UNMAPPEDACTION_IGNORE, rc=rc)
-       if (chkerr(rc,__LINE__,u_FILE_u)) return
     else if (mapindex == mapbilnr_nstod) then
        if (mastertask) then
           write(logunit,'(A)') trim(subname)//' creating RH '//trim(mapname)//' for '//trim(string)
@@ -370,7 +356,7 @@ contains
             dstStatusField=dststatusfield, &
             unmappedaction=ESMF_UNMAPPEDACTION_IGNORE, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-    else if (mapindex == mapconsf .or. mapindex == mapnstod_consf) then
+    else if (mapindex == mapconsf .or. mapindex == mapnstod_consf .or. mapindex == mapfillv_consf) then
        if (mastertask) then
           write(logunit,'(A)') trim(subname)//' creating RH '//trim(mapname)//' for '//trim(string)
        end if
@@ -525,8 +511,9 @@ contains
   logical function med_map_RH_is_created_RH1d(RHs,mapindex,rc)
 
     use ESMF    , only : ESMF_RouteHandle, ESMF_RouteHandleIsCreated
-    use esmFlds , only : mapconsd, mapconsf, mapnstod
+    use esmFlds , only : mapconsd, mapconsf, mapnstod, mapbilnr
     use esmFlds , only : mapnstod_consd, mapnstod_consf
+    use esmFlds , only : mapfillv_bilnr, mapfillv_consf
 
     ! input/output varaibes
     type(ESMF_RouteHandle) , intent(in)    :: RHs(:)
@@ -558,6 +545,16 @@ contains
        rc = rc1
        if (chkerr(rc,__LINE__,u_FILE_u)) return
        rc = rc2
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       mapexists = .true.
+    else if (mapindex == mapfillv_bilnr .and. &
+             ESMF_RouteHandleIsCreated(RHs(mapbilnr), rc=rc1)) then
+       rc = rc1
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       mapexists = .true.
+    else if (mapindex == mapfillv_consf .and. &
+             ESMF_RouteHandleIsCreated(RHs(mapconsf), rc=rc1)) then
+       rc = rc1
        if (chkerr(rc,__LINE__,u_FILE_u)) return
        mapexists = .true.
     else if (ESMF_RouteHandleIsCreated(RHs(mapindex), rc=rc1)) then
@@ -1228,8 +1225,8 @@ contains
     use ESMF            , only : ESMF_REGION_SELECT
     use ESMF            , only : ESMF_RouteHandle
     use esmFlds         , only : mapnstod_consd, mapnstod_consf, mapnstod_consd, mapnstod
-    use esmFlds         , only : mapconsd, mapconsf
-    use esmFlds         , only : mapfillv_bilnr
+    use esmFlds         , only : mapconsd, mapconsf, mapbilnr
+    use esmFlds         , only : mapfillv_bilnr, mapfillv_consf
     use med_methods_mod , only : Field_diagnose => med_methods_Field_diagnose
 
     ! input/output variables
@@ -1292,11 +1289,25 @@ contains
           call Field_diagnose(field_dst, lfldname, " --> after fillv: ", rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
        end if
-       call ESMF_FieldRegrid(field_src, field_dst, routehandle=RouteHandles(mapfillv_bilnr), &
+       call ESMF_FieldRegrid(field_src, field_dst, routehandle=RouteHandles(mapbilnr), &
             termorderflag=ESMF_TERMORDER_SRCSEQ, checkflag=checkflag, zeroregion=ESMF_REGION_SELECT, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
        if (dbug_flag > 1) then
           call Field_diagnose(field_dst, lfldname, " --> after bilnr: ", rc=rc)
+          if (chkerr(rc,__LINE__,u_FILE_u)) return
+       end if
+    else if (maptype == mapfillv_consf) then
+       call ESMF_FieldFill(field_dst, dataFillScheme="const", const1=fillValue, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       if (dbug_flag > 1) then
+          call Field_diagnose(field_dst, lfldname, " --> after fillv: ", rc=rc)
+          if (chkerr(rc,__LINE__,u_FILE_u)) return
+       end if
+       call ESMF_FieldRegrid(field_src, field_dst, routehandle=RouteHandles(mapconsf), &
+            termorderflag=ESMF_TERMORDER_SRCSEQ, checkflag=checkflag, zeroregion=ESMF_REGION_SELECT, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       if (dbug_flag > 1) then
+          call Field_diagnose(field_dst, lfldname, " --> after consf: ", rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
        end if
     else
