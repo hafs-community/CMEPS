@@ -429,6 +429,11 @@ contains
          polemethod = ESMF_POLEMETHOD_NONE ! todo: remove this when ESMF tripolar mapping fix is in place.
        endif
     end if
+    if (trim(coupling_mode) == 'hafs.mom6') then
+    !  if (n1 == compocn .or. n2 == compocn) then
+          polemethod = ESMF_POLEMETHOD_NONE ! todo: remove this when ESMF tripolar mapping fix is in place.
+    !  endif
+    endif
 
     ! Create route handle
     if (mapindex == mapfcopy) then
@@ -968,6 +973,7 @@ contains
     character(cl)                 :: field_name
     character(cl), allocatable    :: field_namelist_dat(:)
     logical                       :: skip_mapping
+    logical                       :: isFound
     type(ESMF_Region_Flag)        :: zeroregion
     real(ESMF_KIND_R8), parameter :: fillValue = 9.99e20_ESMF_KIND_R8
     character(len=*), parameter   :: subname=' (med_map_mod:med_map_field_packed) '
@@ -1078,6 +1084,7 @@ contains
 
                 ! Loop over fields and fill it if there is a match
                 do nf = 1,fieldcount
+                   isFound = .false.
                    ! Get the indices into the packed data structure
                    np = packed_data(mapindex)%fldindex(nf)
                    if (np > 0) then
@@ -1120,10 +1127,20 @@ contains
                               if (chkerr(rc,__LINE__,u_FILE_u)) return
                            end if
 
+                           isFound = .true.
                            ! Exit from loop since match is already found
                            exit
                         end if
                      end do
+                     if (.not. isFound) then
+                        call Field_diagnose(packed_data(mapindex)%field_dst, trim(field_name), " --> not found field : ", rc=rc)
+                        if (chkerr(rc,__LINE__,u_FILE_u)) return
+                        call ESMF_FieldFill(packed_data(mapindex)%field_dst, dataFillScheme="const", const1=fillValue, rc=rc)
+                        !call ESMF_FieldFill(packed_data(mapindex)%field_dst, dataFillScheme="const", const1=0.0_R8, rc=rc)
+                        if (chkerr(rc,__LINE__,u_FILE_u)) return
+                        call Field_diagnose(packed_data(mapindex)%field_dst, trim(field_name), " --> not found field after : ", rc=rc)
+                        if (chkerr(rc,__LINE__,u_FILE_u)) return
+                     end if
                    end if
                 end do
 
