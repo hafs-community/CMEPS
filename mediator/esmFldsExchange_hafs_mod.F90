@@ -379,7 +379,7 @@ contains
     use med_internalstate_mod , only : InternalState
     use med_internalstate_mod , only : mapbilnr, mapconsf, mapconsd, mappatch
     use med_internalstate_mod , only : mapfcopy, mapnstod, mapnstod_consd
-    use med_internalstate_mod , only : mapfillv_bilnr, mapbilnr_nstod
+    use med_internalstate_mod , only : mapfillv_bilnr
     use med_internalstate_mod , only : mapnstod_consf
     use esmFlds               , only : addmap_from => med_fldList_addmap_from
     use esmFlds               , only : addmrg_to   => med_fldList_addmrg_to
@@ -489,7 +489,6 @@ contains
               fldchk(is_local%wrap%FBImp(compwav,compwav),trim(fldname),rc=rc) &
              ) then
              call addmap_from(compwav, trim(fldname), compatm, &
-                  !mapbilnr_nstod, hafs_attr%mapnorm, hafs_attr%wav2atm_smap)
                   mapfillv_bilnr, hafs_attr%mapnorm, hafs_attr%wav2atm_smap)
              call addmrg_to(compatm, trim(fldname), &
                   mrg_from=compwav, mrg_fld=trim(fldname), mrg_type='copy')
