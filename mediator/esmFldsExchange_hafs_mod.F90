@@ -606,7 +606,8 @@ contains
        fldname = trim(S_flds(n))
        if ( fldchk(is_local%wrap%FBexp(compocn)        , fldname, rc=rc) .and. &
             fldchk(is_local%wrap%FBImp(compwav,compwav), fldname, rc=rc)) then
-           call addmap_from(compwav, fldname, compocn, mapfillv_bilnr, 'one', 'unset')
+           call addmap_from(compwav, fldname, compocn, mapfillv_bilnr, &
+                hafs_attr%mapnorm, 'unset')
            call addmrg_to(compocn, fldname, mrg_from=compwav, mrg_fld=fldname, mrg_type='copy')
        end if
     end do
@@ -624,7 +625,7 @@ contains
       S_flds = (/'Sa_u10m', 'Sa_v10m'/)
       do n = 1,size(S_flds)
         fldname = trim(S_flds(n))
-        if (fldchk(is_local%wrap%FBexp(compwav),trim(fldname),rc=rc) .and. &
+        if (fldchk(is_local%wrap%FBexp(compwav), trim(fldname),rc=rc) .and. &
             fldchk(is_local%wrap%FBImp(compatm,compatm), trim(fldname),rc=rc) &
            ) then
            call addmap_from(compatm, trim(fldname), compwav, &
@@ -647,7 +648,8 @@ contains
        fldname = trim(S_flds(n))
        if ( fldchk(is_local%wrap%FBexp(compwav)        , fldname, rc=rc) .and. &
             fldchk(is_local%wrap%FBImp(compocn,compocn), fldname, rc=rc)) then
-          call addmap_from(compocn, fldname, compwav, mapfillv_bilnr , 'one', 'unset')
+          call addmap_from(compocn, fldname, compwav, mapfillv_bilnr, &
+               hafs_attr%mapnorm, 'unset')
           call addmrg_to(compwav, fldname, mrg_from=compocn, mrg_fld=fldname, mrg_type='copy')
        end if
     end do
