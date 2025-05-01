@@ -11,6 +11,9 @@ module esmFldsExchange_ufs_mod
 
   public :: esmFldsExchange_ufs
 
+  integer :: atm2lnd_maptype
+  integer :: lnd2atm_maptype
+
   character(*), parameter :: u_FILE_u = &
        __FILE__
 
@@ -30,7 +33,7 @@ contains
     use med_internalstate_mod , only : mapbilnr, mapconsf, mapconsd, mappatch
     use med_internalstate_mod , only : mapfcopy, mapnstod, mapnstod_consd, mapnstod_consf
     use med_internalstate_mod , only : mapconsf_aofrac, mapbilnr_nstod
-    use med_internalstate_mod , only : coupling_mode, mapnames
+    use med_internalstate_mod , only : coupling_mode, mapnames, samegrid_atmlnd
     use esmFlds               , only : med_fldList_type
     use esmFlds               , only : addfld_to => med_fldList_addfld_to
     use esmFlds               , only : addmrg_to => med_fldList_addmrg_to
@@ -55,6 +58,9 @@ contains
     character(len=CS)   :: fldname
     character(len=CS), allocatable :: flds(:), oflds(:), aflds(:), iflds(:)
     character(len=*) , parameter   :: subname='(esmFldsExchange_ufs)'
+
+    ! component name
+    character(len=CS) :: lnd_name = ''    
     !--------------------------------------
 
     rc = ESMF_SUCCESS
@@ -76,10 +82,27 @@ contains
     write(msgString,'(A,i6,A)') trim(subname)//': maptype is ',maptype,', '//mapnames(maptype)
     call ESMF_LogWrite(trim(msgString), ESMF_LOGMSG_INFO)
 
+    ! determine which land model is present
+    if (is_local%wrap%comp_present(complnd)) then
+       call NUOPC_CompAttributeGet(gcomp, name="LND_model", value=cvalue, rc=rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       lnd_name = trim(cvalue)
+    end if
+
     if (trim(coupling_mode) == 'ufs.nfrac.aoflux' .or. trim(coupling_mode) == 'ufs.frac.aoflux') then
        med_aoflux_to_ocn = .true.
     else
        med_aoflux_to_ocn = .false.
+    end if
+
+    ! determine if atm and lnd have the same mesh
+    if (phase == 'advertise') then
+       atm2lnd_maptype = maptype
+       lnd2atm_maptype = maptype
+       if (samegrid_atmlnd) then
+          atm2lnd_maptype = mapfcopy
+          lnd2atm_maptype = mapfcopy
+       end if
     end if
 
     !=====================================================================
@@ -131,9 +154,10 @@ contains
        deallocate(flds)
 
        ! from med: fields returned by the atm/ocn flux computation, otherwise unadvertised
-       allocate(flds(8))
-       flds = (/'So_tref  ', 'So_qref  ', 'So_ustar ', 'So_re    ','So_ssq   ', 'So_u10   ', &
-                'So_duu10n', 'Faox_lat '/)
+       allocate(flds(12))
+       flds = (/'So_tref       ', 'So_qref       ', 'So_ustar      ', 'So_re         ', 'So_ssq        ', &
+                'So_u10        ', 'So_duu10n     ', 'Faox_lat      ', 'So_ugustOut   ', 'So_u10withGust', &
+                'So_u10res     ', 'Faxa_rainc    '/)
        do n = 1,size(flds)
           fldname = trim(flds(n))
           if (phase == 'advertise') then
@@ -247,7 +271,7 @@ contains
           do n = 1,size(flds)
              if ( fldchk(is_local%wrap%FBexp(compatm)        , 'Fall_'//trim(flds(n)), rc=rc) .and. &
                   fldchk(is_local%wrap%FBImp(complnd,complnd), 'Fall_'//trim(flds(n)), rc=rc)) then
-                call addmap_from(complnd, 'Fall_'//trim(flds(n)), compatm, maptype, 'lfrac', 'unset')
+                call addmap_from(complnd, 'Fall_'//trim(flds(n)), compatm, lnd2atm_maptype, 'lfrac', 'unset')
                 call addmrg_to(compatm, 'Fall_'//trim(flds(n)), mrg_from=complnd, mrg_fld='Fall_'//trim(flds(n)), mrg_type='copy')
              end if
           end do
@@ -268,7 +292,7 @@ contains
           do n = 1,size(flds)
              if ( fldchk(is_local%wrap%FBexp(compatm)        , 'Sl_'//trim(flds(n)), rc=rc) .and. &
                   fldchk(is_local%wrap%FBImp(complnd,complnd), 'Sl_'//trim(flds(n)), rc=rc)) then
-                call addmap_from(complnd, 'Sl_'//trim(flds(n)), compatm, maptype, 'lfrac', 'unset')
+                call addmap_from(complnd, 'Sl_'//trim(flds(n)), compatm, lnd2atm_maptype, 'lfrac', 'unset')
                 call addmrg_to(compatm, 'Sl_'//trim(flds(n)), mrg_from=complnd, mrg_fld='Sl_'//trim(flds(n)), mrg_type='copy')
              end if
           end do
@@ -765,12 +789,34 @@ contains
        else
           if ( fldchk(is_local%wrap%FBexp(complnd)        , fldname, rc=rc) .and. &
                fldchk(is_local%wrap%FBImp(compatm,compatm), fldname, rc=rc)) then
-             call addmap_from(compatm, fldname, complnd, maptype, 'one', 'unset')
+             call addmap_from(compatm, fldname, complnd, atm2lnd_maptype, 'one', 'unset')
              call addmrg_to(complnd, fldname, mrg_from=compatm, mrg_fld=fldname, mrg_type='copy')
           end if
        end if
     end do
     deallocate(flds)
+
+
+    if (lnd_name == 'lm4') then
+       allocate(flds(4))
+       flds = (/'Faxa_swndr', 'Faxa_swndf', 'Faxa_swvdr', 'Faxa_swvdf' /)
+       do n = 1,size(flds)
+          fldname = trim(flds(n))
+          if (phase == 'advertise') then
+             if (is_local%wrap%comp_present(compatm) .and. is_local%wrap%comp_present(complnd)) then
+                call addfld_from(compatm , fldname)
+                call addfld_to(complnd   , fldname)
+             end if
+          else
+             if ( fldchk(is_local%wrap%FBexp(complnd)        , fldname, rc=rc) .and. &
+                  fldchk(is_local%wrap%FBImp(compatm,compatm), fldname, rc=rc)) then
+                call addmap_from(compatm, fldname, complnd, maptype, 'one', 'unset')
+                call addmrg_to(complnd, fldname, mrg_from=compatm, mrg_fld=fldname, mrg_type='copy')
+             end if
+          end if
+       end do 
+       deallocate(flds)       
+    end if ! lm4
 
   end subroutine esmFldsExchange_ufs
 
