@@ -379,7 +379,7 @@ contains
     use med_internalstate_mod , only : InternalState
     use med_internalstate_mod , only : mapbilnr, mapconsf, mapconsd, mappatch
     use med_internalstate_mod , only : mapfcopy, mapnstod, mapnstod_consd
-    use med_internalstate_mod , only : mapfillv_bilnr, mapbilnr_nstod
+    use med_internalstate_mod , only : mapfillv_bilnr
     use med_internalstate_mod , only : mapnstod_consf
     use esmFlds               , only : addmap_from => med_fldList_addmap_from
     use esmFlds               , only : addmrg_to   => med_fldList_addmrg_to
@@ -489,7 +489,6 @@ contains
               fldchk(is_local%wrap%FBImp(compwav,compwav),trim(fldname),rc=rc) &
              ) then
              call addmap_from(compwav, trim(fldname), compatm, &
-                  !mapbilnr_nstod, hafs_attr%mapnorm, hafs_attr%wav2atm_smap)
                   mapfillv_bilnr, hafs_attr%mapnorm, hafs_attr%wav2atm_smap)
              call addmrg_to(compatm, trim(fldname), &
                   mrg_from=compwav, mrg_fld=trim(fldname), mrg_type='copy')
@@ -607,7 +606,8 @@ contains
        fldname = trim(S_flds(n))
        if ( fldchk(is_local%wrap%FBexp(compocn)        , fldname, rc=rc) .and. &
             fldchk(is_local%wrap%FBImp(compwav,compwav), fldname, rc=rc)) then
-           call addmap_from(compwav, fldname, compocn, mapbilnr_nstod, 'one', 'unset')
+           call addmap_from(compwav, fldname, compocn, mapfillv_bilnr, &
+                hafs_attr%mapnorm, 'unset')
            call addmrg_to(compocn, fldname, mrg_from=compwav, mrg_fld=fldname, mrg_type='copy')
        end if
     end do
@@ -625,7 +625,7 @@ contains
       S_flds = (/'Sa_u10m', 'Sa_v10m'/)
       do n = 1,size(S_flds)
         fldname = trim(S_flds(n))
-        if (fldchk(is_local%wrap%FBexp(compwav),trim(fldname),rc=rc) .and. &
+        if (fldchk(is_local%wrap%FBexp(compwav), trim(fldname),rc=rc) .and. &
             fldchk(is_local%wrap%FBImp(compatm,compatm), trim(fldname),rc=rc) &
            ) then
            call addmap_from(compatm, trim(fldname), compwav, &
@@ -648,7 +648,8 @@ contains
        fldname = trim(S_flds(n))
        if ( fldchk(is_local%wrap%FBexp(compwav)        , fldname, rc=rc) .and. &
             fldchk(is_local%wrap%FBImp(compocn,compocn), fldname, rc=rc)) then
-          call addmap_from(compocn, fldname, compwav, mapbilnr_nstod , 'one', 'unset')
+          call addmap_from(compocn, fldname, compwav, mapfillv_bilnr, &
+               hafs_attr%mapnorm, 'unset')
           call addmrg_to(compwav, fldname, mrg_from=compocn, mrg_fld=fldname, mrg_type='copy')
        end if
     end do
