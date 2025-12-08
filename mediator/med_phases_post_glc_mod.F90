@@ -2,22 +2,21 @@ module med_phases_post_glc_mod
 
   !-----------------------------------------------------------------------------
   ! Mediator phase for mapping glc->lnd and glc->ocn after the receive of glc
+  ! ASSUMES that multiple ice sheets do not overlap
   !-----------------------------------------------------------------------------
 
   use med_kind_mod          , only : CX=>SHR_KIND_CX, CS=>SHR_KIND_CS, CL=>SHR_KIND_CL, R8=>SHR_KIND_R8
   use NUOPC                 , only : NUOPC_CompAttributeGet
-  use ESMF                  , only : operator(/=)
-  use ESMF                  , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_LOGMSG_ERROR, ESMF_SUCCESS, ESMF_FAILURE
+  use ESMF                  , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_SUCCESS
   use ESMF                  , only : ESMF_FieldBundle, ESMF_FieldBundleGet
   use ESMF                  , only : ESMF_GridComp, ESMF_GridCompGet
-  use ESMF                  , only : ESMF_StateGet, ESMF_StateItem_Flag, ESMF_STATEITEM_NOTFOUND
-  use ESMF                  , only : ESMF_Mesh, ESMF_MeshLoc, ESMF_MESHLOC_ELEMENT, ESMF_TYPEKIND_R8
+  use ESMF                  , only : ESMF_StateGet, ESMF_StateItem_Flag
+  use ESMF                  , only : ESMF_Mesh, ESMF_MESHLOC_ELEMENT, ESMF_TYPEKIND_R8
   use ESMF                  , only : ESMF_Field, ESMF_FieldGet, ESMF_FieldCreate
   use ESMF                  , only : ESMF_RouteHandle, ESMF_RouteHandleIsCreated
-  use esmFlds               , only : compatm, compice, complnd, comprof, compocn, ncomps, compname
-  use esmFlds               , only : max_icesheets, num_icesheets, compglc
-  use esmFlds               , only : mapbilnr, mapconsd, compname
-  use esmFlds               , only : fldListTo
+  use med_internalstate_mod , only : compatm, compice, complnd, comprof, compocn, compname, compglc
+  use med_internalstate_mod , only : mapbilnr, mapconsd, compname
+  use med_internalstate_mod , only : InternalState, maintask, logunit
   use med_methods_mod       , only : fldbun_diagnose  => med_methods_FB_diagnose
   use med_methods_mod       , only : fldbun_fldchk    => med_methods_FB_fldchk
   use med_methods_mod       , only : fldbun_getmesh   => med_methods_FB_getmesh
@@ -27,15 +26,11 @@ module med_phases_post_glc_mod
   use med_methods_mod       , only : field_getdata2d  => med_methods_Field_getdata2d
   use med_utils_mod         , only : chkerr           => med_utils_ChkErr
   use med_constants_mod     , only : dbug_flag        => med_constants_dbug_flag
-  use med_internalstate_mod , only : InternalState, mastertask, logunit
   use med_map_mod           , only : med_map_rh_is_created, med_map_routehandles_init
   use med_map_mod           , only : med_map_field_packed, med_map_field_normalized, med_map_field
-  use med_merge_mod         , only : med_merge_auto
-  use glc_elevclass_mod     , only : glc_get_num_elevation_classes
-  use glc_elevclass_mod     , only : glc_mean_elevation_virtual
-  use glc_elevclass_mod     , only : glc_get_fractional_icecov
+  use glc_elevclass_mod     , only : glc_mean_elevation_virtual, glc_get_fractional_icecov
   use perf_mod              , only : t_startf, t_stopf
-
+  use shr_log_mod           , only : shr_log_error
   implicit none
   private
 
@@ -61,7 +56,7 @@ module med_phases_post_glc_mod
      type(ESMF_Field) :: field_topo_x_icemask_g_ec ! elevation classes
      type(ESMF_Mesh)  :: mesh_g
   end type ice_sheet_tolnd_type
-  type(ice_sheet_tolnd_type) :: ice_sheet_tolnd(max_icesheets)
+  type(ice_sheet_tolnd_type), allocatable :: ice_sheet_tolnd(:)
 
   type(ESMF_field) :: field_icemask_l                ! no elevation classes
   type(ESMF_Field) :: field_frac_l_ec                ! elevation classes
@@ -73,7 +68,7 @@ module med_phases_post_glc_mod
 
   logical :: cism_evolve = .false.
   logical :: glc2lnd_coupling = .false.
-  logical :: glc2ocn_coupling = .false.
+  logical :: glc2rof_coupling = .false.
   logical :: glc2ice_coupling = .false.
 
   character(*) , parameter :: u_FILE_u = &
@@ -85,15 +80,18 @@ contains
 
   subroutine med_phases_post_glc(gcomp, rc)
 
+    use NUOPC_Mediator        , only : NUOPC_MediatorGet
+    use ESMF                  , only : ESMF_Clock, ESMF_ClockIsCreated
+    use med_phases_history_mod, only : med_phases_history_write_comp
+
     ! input/output variables
     type(ESMF_GridComp)  :: gcomp
     integer, intent(out) :: rc
 
     ! local variables
-    type(ESMF_StateItem_Flag) :: itemType
+    type(ESMF_Clock)          :: dClock
     type(InternalState)       :: is_local
-    integer                   :: n1,ncnt,ns
-    real(r8)                  :: nextsw_cday
+    integer                   :: ns
     logical                   :: first_call = .true.
     logical                   :: isPresent
     character(CL)             :: cvalue
@@ -114,29 +112,29 @@ contains
 
     if (first_call) then
        ! determine if there will be any glc to lnd coupling
-       do ns = 1,num_icesheets
+       do ns = 1,is_local%wrap%num_icesheets
           if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
              glc2lnd_coupling = .true.
              exit
           end if
        end do
        ! determine if there will be any glc to ocn coupling
-       do ns = 1,num_icesheets
-          if (is_local%wrap%med_coupling_active(compglc(ns),compocn)) then
-             glc2ocn_coupling = .true.
+       do ns = 1,is_local%wrap%num_icesheets
+          if (is_local%wrap%med_coupling_active(compglc(ns),comprof)) then
+             glc2rof_coupling = .true.
              exit
           end if
        end do
        ! determine if there will be any glc to ice coupling
-       do ns = 1,num_icesheets
+       do ns = 1,is_local%wrap%num_icesheets
           if (is_local%wrap%med_coupling_active(compglc(ns),compice)) then
              glc2ice_coupling = .true.
              exit
           end if
        end do
-       if (mastertask) then
+       if (maintask) then
           write(logunit,'(a,L1)') trim(subname) // 'glc2lnd_coupling is ',glc2lnd_coupling
-          write(logunit,'(a,L1)') trim(subname) // 'glc2ocn_coupling is ',glc2ocn_coupling
+          write(logunit,'(a,L1)') trim(subname) // 'glc2rof_coupling is ',glc2rof_coupling
           write(logunit,'(a,L1)') trim(subname) // 'glc2ice_coupling is ',glc2ice_coupling
        end if
 
@@ -147,26 +145,26 @@ contains
           call NUOPC_CompAttributeGet(gcomp, name="cism_evolve", value=cvalue, isPresent=isPresent, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
           read (cvalue,*) cism_evolve
-          if (mastertask) then
+          if (maintask) then
              write(logunit,'(a,l7)') trim(subname)//' cism_evolve = ',cism_evolve
           end if
        end if
     end if
 
     !---------------------------------------
-    ! glc->ocn mapping -
-    ! merging with rof->ocn fields is done in med_phases_prep_ocn
+    ! glc->rof mapping
     !---------------------------------------
-    if (glc2ocn_coupling) then
-       do ns = 1,num_icesheets
-          if (is_local%wrap%med_coupling_active(compglc(ns),compocn)) then
+
+    if (glc2rof_coupling) then
+       do ns = 1,is_local%wrap%num_icesheets
+          if (is_local%wrap%med_coupling_active(compglc(ns),comprof)) then
              call med_map_field_packed( &
                   FBSrc=is_local%wrap%FBImp(compglc(ns),compglc(ns)), &
-                  FBDst=is_local%wrap%FBImp(compglc(ns),compocn), &
+                  FBDst=is_local%wrap%FBImp(compglc(ns),comprof), &
                   FBFracSrc=is_local%wrap%FBFrac(compglc(ns)), &
-                  field_normOne=is_local%wrap%field_normOne(compglc(ns),compocn,:), &
-                  packed_data=is_local%wrap%packed_data(compglc(ns),compocn,:), &
-                  routehandles=is_local%wrap%RH(compglc(ns),compocn,:), rc=rc)
+                  field_normOne=is_local%wrap%field_normOne(compglc(ns),comprof,:), &
+                  packed_data=is_local%wrap%packed_data(compglc(ns),comprof,:), &
+                  routehandles=is_local%wrap%RH(compglc(ns),comprof,:), rc=rc)
              if (ChkErr(rc,__LINE__,u_FILE_u)) return
           end if
        end do
@@ -185,7 +183,7 @@ contains
     if (glc2lnd_coupling) then
        ! The will following will map and merge Sg_frac and Sg_topo (and in the future Flgg_hflx)
        call t_startf('MED:'//trim(subname)//' glc2lnd ')
-       do ns = 1,num_icesheets
+       do ns = 1,is_local%wrap%num_icesheets
           if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
              call med_map_field_packed( &
                   FBSrc=is_local%wrap%FBImp(compglc(ns),compglc(ns)), &
@@ -213,6 +211,16 @@ contains
     ! Reset first call logical
     first_call = .false.
 
+    ! Write glc inst, avg or aux if requested in mediator attributes
+    call NUOPC_MediatorGet(gcomp, driverClock=dClock, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (ESMF_ClockIsCreated(dclock)) then
+       do ns = 1,is_local%wrap%num_icesheets
+          call med_phases_history_write_comp(gcomp, compglc(ns), rc=rc)
+          if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       end do
+    end if
+
     if (dbug_flag > 20) then
        call ESMF_LogWrite(trim(subname)//": done", ESMF_LOGMSG_INFO)
     end if
@@ -221,7 +229,6 @@ contains
   end subroutine med_phases_post_glc
 
   !================================================================================================
-
   subroutine map_glc2lnd_init(gcomp, rc)
 
     ! input/output variables
@@ -233,9 +240,7 @@ contains
     type(ESMF_Field)          :: lfield_l
     type(ESMF_Mesh)           :: mesh_l
     integer                   :: ungriddedUBound_output(1)
-    integer                   :: fieldCount
-    integer                   :: ns,n
-    type(ESMF_Field), pointer :: fieldlist(:) => null()
+    integer                   :: ns
     character(len=*) , parameter   :: subname='(map_glc2lnd_init)'
     !---------------------------------------
 
@@ -287,7 +292,10 @@ contains
     ! create module fields on glc mesh
     !---------------------------------------
 
-    do ns = 1,max_icesheets
+    ! allocate module variable
+    allocate(ice_sheet_tolnd(is_local%wrap%num_icesheets))
+
+    do ns = 1,is_local%wrap%num_icesheets
        if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
 
           call fldbun_getmesh(is_local%wrap%FBImp(compglc(ns),compglc(ns)), ice_sheet_tolnd(ns)%mesh_g, rc)
@@ -325,10 +333,8 @@ contains
 
     ! Currently cannot map hflx in multiple elevation classes from glc to land
     if (fldbun_fldchk(is_local%wrap%FBExp(complnd), trim(Flgg_hflx), rc=rc)) then
-       call ESMF_LogWrite(trim(subname)//'ERROR: Flgg_hflx to land has not been implemented yet', &
-            ESMF_LOGMSG_ERROR, line=__LINE__, file=__FILE__)
-       rc = ESMF_FAILURE
-       return
+       call shr_log_error(trim(subname)//'ERROR: Flgg_hflx to land has not been implemented yet', &
+            line=__LINE__, file=__FILE__, rc=rc)
     end if
 
   end subroutine map_glc2lnd_init
@@ -348,27 +354,23 @@ contains
 
     ! local variables
     type(InternalState)   :: is_local
-    type(ESMF_Field)      :: lfield
-    type(ESMF_Field)      :: lfield_src
-    type(ESMF_Field)      :: lfield_dst
-    integer               :: ec, l, g, ns, n
+    integer               :: ec, l, ns
     real(r8)              :: topo_virtual
-    real(r8), pointer     :: icemask_g(:) => null()             ! glc ice mask field on glc grid
-    real(r8), pointer     :: frac_g(:) => null()                ! total ice fraction in each glc cell
-    real(r8), pointer     :: frac_g_ec(:,:) => null()           ! glc fractions on the glc grid
-    real(r8), pointer     :: frac_l_ec(:,:) => null()           ! glc fractions on the land grid
-    real(r8), pointer     :: topo_g(:) => null()                ! topo height of each glc cell (no elev classes)
-    real(r8), pointer     :: topo_l_ec(:,:) => null()           ! topo height in each land gridcell for each elev class
-    real(r8), pointer     :: frac_x_icemask_g_ec(:,:) => null() ! (glc fraction) x (icemask), on the glc grid
-    real(r8), pointer     :: frac_x_icemask_l_ec(:,:) => null()
-    real(r8), pointer     :: topo_x_icemask_g_ec(:,:) => null()
-    real(r8), pointer     :: topo_x_icemask_l_ec(:,:) => null()
-    real(r8), pointer     :: dataptr1d(:) => null()
-    real(r8), pointer     :: dataptr2d(:,:) => null()
-    real(r8), pointer     :: frac_l_ec_sum(:,:) => null()
-    real(r8), pointer     :: topo_l_ec_sum(:,:) => null()
-    real(r8), pointer     :: dataptr1d_src(:) => null()
-    real(r8), pointer     :: dataptr1d_dst(:) => null()
+    real(r8), pointer     :: icemask_g(:)              ! glc ice mask field on glc grid
+    real(r8), pointer     :: frac_g(:)                 ! total ice fraction in each glc cell
+    real(r8), pointer     :: frac_g_ec(:,:)            ! glc fractions on the glc grid
+    real(r8), pointer     :: frac_l_ec(:,:)            ! glc fractions on the land grid
+    real(r8), pointer     :: topo_g(:)                 ! topo height of each glc cell (no elev classes)
+    real(r8), pointer     :: topo_l_ec(:,:)            ! topo height in each land gridcell for each elev class
+    real(r8), pointer     :: frac_x_icemask_g_ec(:,:)  ! (glc fraction) x (icemask), on the glc grid
+    real(r8), pointer     :: frac_x_icemask_l_ec(:,:)
+    real(r8), pointer     :: topo_x_icemask_g_ec(:,:)
+    real(r8), pointer     :: dataptr1d(:)
+    real(r8), pointer     :: frac_l_ec_sum(:,:)
+    real(r8), pointer     :: topo_l_ec_sum(:,:)
+    real(r8), pointer     :: dataptr1d_src(:)
+    real(r8), pointer     :: dataptr1d_dst(:)
+    real(r8), pointer     :: icemask_l(:)
     character(len=*), parameter :: subname = 'map_glc2lnd'
     !-----------------------------------------------------------------------
 
@@ -403,7 +405,7 @@ contains
     !---------------------------------
 
     ! Map Sg_icemask and Sg_icemask_coupled_fluxes (no elevation classes)
-    do ns = 1,num_icesheets
+    do ns = 1,is_local%wrap%num_icesheets
        if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
           call t_startf('MED:'//trim(subname)//' glc2lnd ')
           call med_map_field_packed( &
@@ -421,7 +423,7 @@ contains
     ! Get Sg_icemask on land as sum of all ice sheets (no elevation classes)
     call fldbun_getdata1d(is_local%wrap%FBExp(complnd), Sg_icemask, dataptr1d_dst, rc)
     dataptr1d_dst(:) = 0._r8
-    do ns = 1,num_icesheets
+    do ns = 1,is_local%wrap%num_icesheets
        if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
           call fldbun_getdata1d(is_local%wrap%FBImp(compglc(ns),complnd), Sg_icemask, dataptr1d_src, rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
@@ -433,7 +435,7 @@ contains
     call fldbun_getdata1d(is_local%wrap%FBExp(complnd), Sg_icemask_coupled_fluxes, dataptr1d_dst, rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
     dataptr1d_dst(:) = 0._r8
-    do ns = 1,num_icesheets
+    do ns = 1,is_local%wrap%num_icesheets
        if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
           call fldbun_getdata1d(is_local%wrap%FBImp(compglc(ns),complnd), Sg_icemask_coupled_fluxes, dataptr1d_src, rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
@@ -441,7 +443,7 @@ contains
        end if
     end do
 
-    do ns = 1,num_icesheets
+    do ns = 1,is_local%wrap%num_icesheets
        if (is_local%wrap%med_coupling_active(compglc(ns),complnd)) then
 
           ! Set (fractional ice coverage for each elevation class on the glc grid)
@@ -538,25 +540,53 @@ contains
           if (chkerr(rc,__LINE__,u_FILE_u)) return
           call field_getdata2d(field_frac_x_icemask_l_ec, frac_x_icemask_l_ec, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
+          call field_getdata1d(field_icemask_l, icemask_l, rc=rc)
+          if (chkerr(rc,__LINE__,u_FILE_u)) return
 
           ! set Sg_topo values in export state to land (in multiple elevation classes)
           ! also set the topo field for virtual columns, in a given elevation class.
           ! This is needed because virtual columns (i.e., elevation classes that have no
           ! contributing glc grid cells) won't have any topographic information mapped onto
           ! them, so would otherwise end up with an elevation of 0.
+          ! ASSUME that multiple ice sheets do not overlap
           do ec = 1,ungriddedCount
              topo_virtual = glc_mean_elevation_virtual(ec-1) ! glc_mean_elevation_virtual uses 0:glc_nec
              do l = 1,size(frac_x_icemask_l_ec, dim=2)
-                if (frac_l_ec_sum(ec,l) <= 0._r8) then
-                   topo_l_ec_sum(ec,l) = topo_l_ec_sum(ec,l) + topo_virtual
-                else
-                   if (frac_x_icemask_l_ec(ec,l) /= 0.0_r8) then
-                      topo_l_ec_sum(ec,l) = topo_l_ec_sum(ec,l) + topo_l_ec(ec,l) / frac_x_icemask_l_ec(ec,l)
+                if (icemask_l(l) > 0._r8) then
+                   ! We only do this where icemask_l > 0 to avoid adding topo_virtual
+                   ! multiple times. If icemask_l == 0 for all ice sheets, then lnd should
+                   ! ignore the topo values from glc, so it's safe to leave them unset; if
+                   ! icemask_l is 0 for this ice sheet but > 0 for some other ice sheet,
+                   ! then we'll get the appropriate topo setting from that other ice
+                   ! sheet.
+                   !
+                   ! Note that frac_l_ec_sum is the sum over ice sheets we have handled so
+                   ! far in the outer loop over ice sheets. At first glance, that could
+                   ! seem wrong (because what if a later ice sheet causes this sum to
+                   ! become greater than 0?), and it may be that we should rework this for
+                   ! clarity. However, since icemask_l > 0 (which is the ice mask for this
+                   ! ice sheet) and we assume that multiple ice sheets do not overlap, we
+                   ! can be confident that no other ice sheet will contribute to
+                   ! frac_l_ec_sum for this land point, so if it is <= 0 at this point,
+                   ! it should remain <= 0.
+                   if (frac_l_ec_sum(ec,l) <= 0._r8) then
+                      ! This is formulated as an addition for consistency with other
+                      ! additions to the *_sum variables, but in practice only one ice
+                      ! sheet will contribute to any land point, given the assumption of
+                      ! non-overlapping ice sheet domains. (If more than one ice sheet
+                      ! contributed to a given land point, the following line would do the
+                      ! wrong thing, since it would add topo_virtual multiple times.)
+                      topo_l_ec_sum(ec,l) = topo_l_ec_sum(ec,l) + topo_virtual
+                   else
+                      if (frac_x_icemask_l_ec(ec,l) /= 0.0_r8) then
+                         topo_l_ec_sum(ec,l) = topo_l_ec_sum(ec,l) + topo_l_ec(ec,l) / frac_x_icemask_l_ec(ec,l)
+                      end if
                    end if
                 end if
              end do
           end do
        end if
+
     end do
 
     if (dbug_flag > 5) then

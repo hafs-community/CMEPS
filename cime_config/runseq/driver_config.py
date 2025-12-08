@@ -46,10 +46,8 @@ class DriverConfig(dict):
     ###############################################
 
         # In the mediator the glc_avg_period will be set as an alarm
-        # on the mediator clock - when this alarm rings - the
-        # averaging will be done AND an attribute will be set on set
-        # on the glc export state from the mediator saying that the
-        # data coming to glc is valid
+        # on the on the prep_glc_clock. When this alarm rings - the
+        # averaging will be done.
 
         comp_glc = case.get_value("COMP_GLC")
 
@@ -60,24 +58,26 @@ class DriverConfig(dict):
             med_to_glc = False
         elif (comp_glc == 'cism'):
             if not case.get_value("CISM_EVOLVE"):
-                med_to_glc = False
+                run_glc = False
 
         # If CISM is not evolving only get data back from cism at the initial time
         # However will still need to call the exchange at the end if the stop_option
         # is nsteps or days - or otherwise just every ndays
         # Note that nsteps is the minimum component coupling time
-        if (comp_glc == 'cism'):
+        if comp_glc == 'cism':
             glc_coupling_time = coupling_times["glc_cpl_dt"]
             if not case.get_value("CISM_EVOLVE"):
                 stop_option = case.get_value('STOP_OPTION')
                 stop_n = case.get_value('STOP_N')
-                if stop_option == 'nsteps':
+                if stop_option == 'nyears':
+                    glc_coupling_time = coupling_times["glc_cpl_dt"]
+                elif stop_option == 'nsteps':
                     glc_coupling_time = stop_n * coupling_times["glc_cpl_dt"]
                 elif stop_option == 'ndays':
                     glc_coupling_time = stop_n * 86400
                 else:
                     glc_coupling_time = 86400
-        elif (comp_glc == 'xglc'):
+        elif comp_glc == 'dglc' or comp_glc == 'xglc':
             glc_coupling_time = coupling_times["glc_cpl_dt"]
         else:
             glc_coupling_time = 0
@@ -132,7 +132,8 @@ class DriverConfig(dict):
             # TODO: check of data model prognostic flag is on - this is a new xml variable
             # If the prognostic flag is on, then should set med_to_wav to True
             docn_mode = case.get_value("DOCN_MODE")
-            med_to_ocn = ('som' in docn_mode or 'interannual' in docn_mode)
+            docn_import_fields = case.get_value("DOCN_IMPORT_FIELDS")
+            med_to_ocn = ('som' in docn_mode or 'interannual' in docn_mode or docn_import_fields != 'none')
 
         return (run_ocn, med_to_ocn, coupling_times["ocn_cpl_dt"])
 

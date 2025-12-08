@@ -6,20 +6,20 @@ module med_io_mod
 
   use med_kind_mod          , only : CX=>SHR_KIND_CX, CS=>SHR_KIND_CS, CL=>SHR_KIND_CL, I8=>SHR_KIND_I8, R8=>SHR_KIND_R8
   use med_kind_mod          , only : R4=>SHR_KIND_R4
-  use shr_const_mod         , only : fillvalue => SHR_CONST_SPVAL
-  use ESMF                  , only : ESMF_VM, ESMF_LogWrite, ESMF_LOGMSG_INFO
-  use ESMF                  , only : ESMF_SUCCESS, ESMF_FAILURE
-  use ESMF                  , only : ESMF_VMGetCurrent, ESMF_VMGet, ESMF_VMBroadCast, ESMF_GridComp
+  use med_constants_mod     , only : fillvalue => SHR_CONST_SPVAL
+  use ESMF                  , only : ESMF_VM, ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_LogFoundError
+  use ESMF                  , only : ESMF_SUCCESS, ESMF_LOGERR_PASSTHRU
+  use ESMF                  , only : ESMF_VMGetCurrent, ESMF_VMGet, ESMF_VMBroadCast, ESMF_Finalize
   use NUOPC                 , only : NUOPC_FieldDictionaryGetEntry
   use NUOPC                 , only : NUOPC_FieldDictionaryHasEntry
   use pio                   , only : file_desc_t, iosystem_desc_t
-  use med_internalstate_mod , only : logunit, med_id
+  use med_internalstate_mod , only : logunit, med_id, maintask
   use med_constants_mod     , only : dbug_flag    => med_constants_dbug_flag
   use med_methods_mod       , only : FB_getFieldN => med_methods_FB_getFieldN
   use med_methods_mod       , only : FB_getFldPtr => med_methods_FB_getFldPtr
   use med_methods_mod       , only : FB_getNameN  => med_methods_FB_getNameN
   use med_utils_mod         , only : chkerr       => med_utils_ChkErr
-
+  use shr_log_mod           , only : shr_log_error
   implicit none
   private
 
@@ -30,6 +30,8 @@ module med_io_mod
   public :: med_io_enddef
   public :: med_io_sec2hms
   public :: med_io_read
+  public :: med_io_define_time
+  public :: med_io_write_time
   public :: med_io_write
   public :: med_io_init
   public :: med_io_date2yyyymmdd
@@ -55,7 +57,6 @@ module med_io_mod
      module procedure med_io_write_r8
      module procedure med_io_write_r81d
      module procedure med_io_write_char
-     module procedure med_io_write_time
   end interface med_io_write
   interface med_io_date2ymd
      module procedure med_io_date2ymd_int
@@ -70,17 +71,11 @@ module med_io_mod
      module procedure med_io_ymd2date_long
   end interface med_io_ymd2date
 
-  !-------------------------------------------------------------------------------
   ! module data
-  !-------------------------------------------------------------------------------
-
   character(*),parameter         :: prefix    = "med_io_"
   character(*),parameter         :: modName   = "(med_io_mod) "
   character(*),parameter         :: version   = "cmeps0"
-  integer    , parameter         :: file_desc_t_cnt = 20 ! Note - this is hard-wired for now
-  integer    , parameter         :: number_strlen = 2
-  character(CL)                  :: wfilename = ''
-  type(file_desc_t)              :: io_file(0:file_desc_t_cnt)
+
   integer                        :: pio_iotype
   integer                        :: pio_ioformat
   type(iosystem_desc_t), pointer :: io_subsystem
@@ -91,7 +86,7 @@ module med_io_mod
 contains
 !=================================================================================
 
-  logical function med_io_file_exists(vm, iam, filename)
+  logical function med_io_file_exists(vm, filename)
 
     !---------------
     ! inquire if i/o file exists
@@ -99,19 +94,24 @@ contains
 
     ! input/output variables
     type(ESMF_VM)                :: vm
-    integer,          intent(in) :: iam
     character(len=*), intent(in) :: filename
 
     ! local variables
     integer :: tmp(1)
+    integer :: iam
     integer :: rc
     !-------------------------------------------------------------------------------
 
     tmp(1) = 0
-    med_io_file_exists = .false.
-    if (iam==0) inquire(file=trim(filename),exist=med_io_file_exists)
-    if (med_io_file_exists) tmp(1) = 1
 
+    call ESMF_VMGet(vm, localPet=iam, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    med_io_file_exists = .false.
+    if (iam==0) then
+       inquire(file=trim(filename),exist=med_io_file_exists)
+       if (med_io_file_exists) tmp(1) = 1
+    end if
     call ESMF_VMBroadCast(vm, tmp, 1, 0, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
 
@@ -126,6 +126,7 @@ contains
     ! initialize pio
     !---------------
 
+    use ESMF , only : ESMF_GridComp, ESMF_UtilStringUpperCase
 #ifdef CESMCOUPLED
     use shr_pio_mod , only : shr_pio_getiosys, shr_pio_getiotype, shr_pio_getioformat
 #else
@@ -136,13 +137,12 @@ contains
     use pio  , only : PIO_REARR_COMM_P2P, PIO_REARR_COMM_COLL
     use pio  , only : PIO_REARR_COMM_FC_2D_ENABLE, PIO_REARR_COMM_FC_2D_DISABLE
     use pio  , only : PIO_REARR_COMM_FC_1D_COMP2IO, PIO_REARR_COMM_FC_1D_IO2COMP
-    use ESMF , only : ESMF_GridComp, ESMF_UtilStringUpperCase
     use NUOPC, only : NUOPC_CompAttributeGet
 #endif
 
     ! input/output arguments
-    type(ESMF_GridComp), intent(in)  :: gcomp
-    integer            , intent(out) :: rc
+    type(ESMF_GridComp), intent(in)    :: gcomp
+    integer            , intent(out)   :: rc
 
 #ifndef CESMCOUPLED
     ! local variables
@@ -195,9 +195,8 @@ contains
        else if (trim(cvalue) .eq. '64BIT_DATA') then
          pio_ioformat = PIO_64BIT_DATA
        else
-         call ESMF_LogWrite(trim(subname)//': need to provide valid option for pio_ioformat (CLASSIC|64BIT_OFFSET|64BIT_DATA)', ESMF_LOGMSG_INFO)
-         rc = ESMF_FAILURE
-         return
+          call shr_log_error(trim(subname)//': need to provide valid option for pio_ioformat (CLASSIC|64BIT_OFFSET|64BIT_DATA)', rc=rc)
+          return
        end if
     else
        cvalue = '64BIT_OFFSET'
@@ -220,9 +219,8 @@ contains
        else if (trim(cvalue) .eq. 'NETCDF4P') then
          pio_iotype = PIO_IOTYPE_NETCDF4P
        else
-         call ESMF_LogWrite(trim(subname)//': need to provide valid option for pio_typename (NETCDF|PNETCDF|NETCDF4C|NETCDF4P)', ESMF_LOGMSG_INFO)
-         rc = ESMF_FAILURE
-         return
+          call shr_log_error(trim(subname)//': need to provide valid option for pio_typename (NETCDF|PNETCDF|NETCDF4C|NETCDF4P)', rc=rc)
+          return
        end if
     else
        cvalue = 'NETCDF'
@@ -331,13 +329,12 @@ contains
        else if (trim(cvalue) .eq. 'SUBSET') then
          pio_rearranger = PIO_REARR_SUBSET
        else
-         call ESMF_LogWrite(trim(subname)//': need to provide valid option for pio_rearranger (BOX|SUBSET)', ESMF_LOGMSG_INFO)
-         rc = ESMF_FAILURE
-         return
+          call shr_log_error(trim(subname)//': need to provide valid option for pio_rearranger (BOX|SUBSET)', rc=rc)
+          return
        end if
     else
-       cvalue = 'BOX'
-       pio_rearranger = PIO_REARR_BOX
+       cvalue = 'SUBSET'
+       pio_rearranger = PIO_REARR_SUBSET
     end if
     if (localPet == 0) write(logunit,*) trim(subname), ' : pio_rearranger = ', trim(cvalue), pio_rearranger
 
@@ -354,9 +351,8 @@ contains
     if (isPresent .and. isSet) then
        read(cvalue,*) pio_debug_level
        if (pio_debug_level < 0 .or. pio_debug_level > 6) then
-         call ESMF_LogWrite(trim(subname)//': need to provide valid option for pio_debug_level (0-6)', ESMF_LOGMSG_INFO)
-         rc = ESMF_FAILURE
-         return
+          call shr_log_error(trim(subname)//': need to provide valid option for pio_debug_level (0-6)', rc=rc)
+          return
        end if
     else
        pio_debug_level = 0
@@ -378,9 +374,8 @@ contains
        else if (trim(cvalue) .eq. 'COLL') then
           pio_rearr_comm_type = PIO_REARR_COMM_COLL
        else
-         call ESMF_LogWrite(trim(subname)//': need to provide valid option for pio_rearr_comm_type (P2P|COLL)', ESMF_LOGMSG_INFO)
-         rc = ESMF_FAILURE
-         return
+          call shr_log_error(trim(subname)//': need to provide valid option for pio_rearr_comm_type (P2P|COLL)', rc=rc)
+          return
        end if
     else
        cvalue = 'P2P'
@@ -403,9 +398,8 @@ contains
        else if (trim(cvalue) .eq. '2DDISABLE') then
           pio_rearr_comm_fcd = PIO_REARR_COMM_FC_2D_DISABLE
        else
-         call ESMF_LogWrite(trim(subname)//': need to provide valid option for pio_rearr_comm_fcd (2DENABLE|IO2COMP|COMP2IO|2DDISABLE)', ESMF_LOGMSG_INFO)
-         rc = ESMF_FAILURE
-         return
+          call shr_log_error(trim(subname)//': need to provide valid option for pio_rearr_comm_fcd (2DENABLE|IO2COMP|COMP2IO|2DDISABLE)', rc=rc)
+          return
        end if
     else
        cvalue = '2DENABLE'
@@ -432,7 +426,7 @@ contains
     else
        pio_rearr_comm_enable_isend_comp2io = .false.
     end if
-   
+
     ! pio_rearr_comm_max_pend_req_comp2io
     call NUOPC_CompAttributeGet(gcomp, name='pio_rearr_comm_max_pend_req_comp2io', value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -495,7 +489,7 @@ contains
   end subroutine med_io_init
 
   !===============================================================================
-  subroutine med_io_wopen(filename, vm, iam, clobber, file_ind, model_doi_url)
+  subroutine med_io_wopen(filename, io_file, vm, rc, clobber, file_ind, model_doi_url)
 
     !---------------
     ! open netcdf file
@@ -508,18 +502,18 @@ contains
 
     ! input/output arguments
     character(*),            intent(in) :: filename
+    type(file_desc_t),       intent(inout) :: io_file
     type(ESMF_VM)                       :: vm
-    integer,                 intent(in) :: iam
+    integer,                 intent(out) :: rc
     logical,       optional, intent(in) :: clobber
     integer,       optional, intent(in) :: file_ind
     character(CL), optional, intent(in) :: model_doi_url
-
     ! local variables
     logical       :: lclobber
     integer       :: rcode
     integer       :: nmode
     integer       :: lfile_ind
-    integer       :: rc
+    integer       :: iam
     character(CL) :: lversion
     character(CL) :: lmodel_doi_url
     character(*),parameter :: subName = '(med_io_wopen) '
@@ -536,34 +530,33 @@ contains
     lfile_ind = 0
     if (present(file_ind)) lfile_ind=file_ind
 
-    if (.not. pio_file_is_open(io_file(lfile_ind))) then
+    call ESMF_VMGet(vm, localPet=iam, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-       ! filename not open
-       wfilename = filename
 
-       if (med_io_file_exists(vm, iam, filename)) then
+    if (.not. pio_file_is_open(io_file)) then
+
+       if (med_io_file_exists(vm, filename)) then
           if (lclobber) then
              nmode = pio_clobber
              ! only applies to classic NETCDF files.
              if(pio_iotype == PIO_IOTYPE_NETCDF .or. pio_iotype == PIO_IOTYPE_PNETCDF) then
                 nmode = ior(nmode,pio_ioformat)
              endif
-             rcode = pio_createfile(io_subsystem, io_file(lfile_ind), pio_iotype, trim(filename), nmode)
-             if(iam==0) write(logunit,*) subname,' create file ',trim(filename)
-             rcode = pio_put_att(io_file(lfile_ind),pio_global,"file_version",version)
-             rcode = pio_put_att(io_file(lfile_ind),pio_global,"model_doi_url",lmodel_doi_url)
+             rcode = pio_createfile(io_subsystem, io_file, pio_iotype, trim(filename), nmode)
+             if(iam==0) write(logunit,'(a)') trim(subname)//' creating file '//trim(filename)
+             rcode = pio_put_att(io_file,pio_global,"file_version",version)
+             rcode = pio_put_att(io_file,pio_global,"model_doi_url",lmodel_doi_url)
           else
-             rcode = pio_openfile(io_subsystem, io_file(lfile_ind), pio_iotype, trim(filename), pio_write)
-             if (iam==0) then
-                write(logunit,*) subname,' open file ',trim(filename)
-             end if
-             call pio_seterrorhandling(io_file(lfile_ind),PIO_BCAST_ERROR)
-             rcode = pio_get_att(io_file(lfile_ind),pio_global,"file_version",lversion)
-             call pio_seterrorhandling(io_file(lfile_ind),PIO_INTERNAL_ERROR)
+             rcode = pio_openfile(io_subsystem, io_file, pio_iotype, trim(filename), pio_write)
+             if (iam==0) write(logunit,'(a)') trim(subname)//' opening file '//trim(filename)
+             call pio_seterrorhandling(io_file,PIO_BCAST_ERROR)
+             rcode = pio_get_att(io_file,pio_global,"file_version",lversion)
+             call pio_seterrorhandling(io_file,PIO_INTERNAL_ERROR)
              if (trim(lversion) /= trim(version)) then
-                rcode = pio_redef(io_file(lfile_ind))
-                rcode = pio_put_att(io_file(lfile_ind),pio_global,"file_version",version)
-                rcode = pio_enddef(io_file(lfile_ind))
+                rcode = pio_redef(io_file)
+                rcode = pio_put_att(io_file,pio_global,"file_version",version)
+                rcode = pio_enddef(io_file)
              endif
           endif
        else
@@ -572,20 +565,13 @@ contains
           if(pio_iotype == PIO_IOTYPE_NETCDF .or. pio_iotype == PIO_IOTYPE_PNETCDF) then
              nmode = ior(nmode,pio_ioformat)
           endif
-          rcode = pio_createfile(io_subsystem, io_file(lfile_ind), pio_iotype, trim(filename), nmode)
-          if (iam==0) then
-             write(logunit,*) subname,' create file ',trim(filename)
-          end if
-          rcode = pio_put_att(io_file(lfile_ind),pio_global,"file_version",version)
-          rcode = pio_put_att(io_file(lfile_ind),pio_global,"model_doi_url",lmodel_doi_url)
+
+          rcode = pio_createfile(io_subsystem, io_file, pio_iotype, trim(filename), nmode)
+          if (iam==0) write(logunit,'(a)') trim(subname) //' creating file '// trim(filename)
+          rcode = pio_put_att(io_file,pio_global,"file_version",version)
+          rcode = pio_put_att(io_file,pio_global,"model_doi_url",lmodel_doi_url)
        endif
-    elseif (trim(wfilename) /= trim(filename)) then
-       ! filename is open, better match open filename
-       if(iam==0) write(logunit,*) subname,' different  filename currently open ',trim(filename)
-       if(iam==0) write(logunit,*) subname,' different wfilename currently open ',trim(wfilename)
-       call ESMF_LogWrite(subname//'different file currently open '//trim(filename), ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
-       return
+
     else
        ! filename is already open, just return
     endif
@@ -593,7 +579,7 @@ contains
   end subroutine med_io_wopen
 
   !===============================================================================
-  subroutine med_io_close(filename, iam, file_ind, rc)
+  subroutine med_io_close(io_file, rc)
 
     !---------------
     ! close netcdf file
@@ -602,75 +588,52 @@ contains
     use pio, only: pio_file_is_open, pio_closefile
 
     ! input/output variables
-    character(*),     intent(in)  :: filename
-    integer,          intent(in)  :: iam
-    integer,optional, intent(in)  :: file_ind
-    integer         , intent(out) :: rc
+    type(file_desc_t) :: io_file
+    integer          , intent(out) :: rc
 
     ! local variables
-    integer :: lfile_ind
+
     character(*),parameter :: subName = '(med_io_close) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-
-    if (.not. pio_file_is_open(io_file(lfile_ind))) then
-       ! filename not open, just return
-    elseif (trim(wfilename) == trim(filename)) then
-       ! filename matches, close it
-       call pio_closefile(io_file(lfile_ind))
-    else
-       ! different filename is open, abort
-       if (iam==0) write(logunit,*) subname,' different  filename currently open, aborting ',trim(filename)
-       if (iam==0) write(logunit,*) subname,' different wfilename currently open, aborting ',trim(wfilename)
-       call ESMF_LogWrite(subname//'different file currently open, aborting '//trim(filename), ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
-       return
+    if (pio_file_is_open(io_file)) then
+       call pio_closefile(io_file)
     endif
-    wfilename = ''
+
   end subroutine med_io_close
 
   !===============================================================================
-  subroutine med_io_redef(filename,file_ind)
+  subroutine med_io_redef(io_file)
 
     use pio, only : pio_redef
 
     ! input/output variables
-    character(len=*), intent(in) :: filename
-    integer,optional,intent(in):: file_ind
-
+    type(file_desc_t) :: io_file
     ! local variables
-    integer :: lfile_ind
     integer :: rcode
     !-------------------------------------------------------------------------------
 
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-    rcode = pio_redef(io_file(lfile_ind))
+    rcode = pio_redef(io_file)
 
   end subroutine med_io_redef
 
   !===============================================================================
-  subroutine med_io_enddef(filename,file_ind)
+  subroutine med_io_enddef(io_file)
 
     use pio, only : pio_enddef
 
     ! input/output variables
-    character(len=*) , intent(in) :: filename
-    integer,optional , intent(in) :: file_ind
+    type(file_desc_t) :: io_file
 
     ! local variables
-    integer :: lfile_ind
+
     integer :: rcode
     !-------------------------------------------------------------------------------
 
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
+    rcode = pio_enddef(io_file)
 
-    rcode = pio_enddef(io_file(lfile_ind))
   end subroutine med_io_enddef
 
   !===============================================================================
@@ -693,14 +656,13 @@ contains
     integer :: hours     ! hours of hh:mm:ss
     integer :: minutes   ! minutes of hh:mm:ss
     integer :: secs      ! seconds of hh:mm:ss
+    character(len=CS) :: msg
     !----------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
     if (seconds < 0 .or. seconds > 86400) then
-       write(logunit,*)'med_io_sec2hms: bad input seconds:', seconds
-       call ESMF_LogWrite('med_io_sec2hms: bad input seconds', ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
+       call shr_log_error('med_io_sec2hms: bad input seconds', rc=rc)
        return
     end if
 
@@ -709,16 +671,14 @@ contains
     secs    = (seconds - hours*3600 - minutes*60)
 
     if (minutes < 0 .or. minutes > 60) then
-       write(logunit,*)'med_io_sec2hms: bad minutes = ',minutes
-       call ESMF_LogWrite('med_io_sec2hms: bad minutes', ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
+       write(msg,*)'med_io_sec2hms: bad minutes = ',minutes
+       call shr_log_error(msg, rc=rc)
        return
     end if
 
     if (secs < 0 .or. secs > 60) then
-       write(logunit,*)'med_io_sec2hms: bad secs = ',secs
-       call ESMF_LogWrite('med_io_sec2hms: bad secs', ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
+       write(msg,*)'med_io_sec2hms: bad secs = ',secs
+       call shr_log_error(msg, rc=rc)
        return
     end if
 
@@ -728,50 +688,52 @@ contains
   end function med_io_sec2hms
 
   !===============================================================================
-  subroutine med_io_write_FB(filename, iam, FB, whead, wdata, nx, ny, nt, &
-       fillval, pre, tavg, use_float, file_ind, rc)
+  subroutine med_io_write_FB(io_file, FB, whead, wdata, nx, ny, nt, &
+       fillval, pre, flds, tavg, use_float, ntile, rc)
 
     !---------------
     ! Write FB to netcdf file
     !---------------
 
-    use ESMF , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_SUCCESS, ESMF_FAILURE
+    use ESMF,  only : operator(==)
+    use ESMF , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_SUCCESS
     use ESMF , only : ESMF_FieldBundleIsCreated, ESMF_FieldBundle, ESMF_Mesh, ESMF_DistGrid
     use ESMF , only : ESMF_FieldBundleGet, ESMF_FieldGet, ESMF_MeshGet, ESMF_DistGridGet
     use ESMF , only : ESMF_Field, ESMF_FieldGet, ESMF_AttributeGet
+    use ESMF , only : ESMF_CoordSys_Flag, ESMF_COORDSYS_SPH_DEG, ESMF_COORDSYS_SPH_RAD, ESMF_COORDSYS_CART
     use pio  , only : var_desc_t, io_desc_t, pio_offset_kind
     use pio  , only : pio_def_dim, pio_inq_dimid, pio_real, pio_def_var, pio_put_att, pio_double
     use pio  , only : pio_inq_varid, pio_setframe, pio_write_darray, pio_initdecomp, pio_freedecomp
     use pio  , only : pio_syncfile
 
     ! input/output variables
-    character(len=*),           intent(in) :: filename  ! file
-    integer,                    intent(in) :: iam       ! local pet
-    type(ESMF_FieldBundle),     intent(in) :: FB        ! data to be written
-    logical,          optional, intent(in) :: whead     ! write header
-    logical,          optional, intent(in) :: wdata     ! write data
-    integer    ,      optional, intent(in) :: nx        ! 2d grid size if available
-    integer    ,      optional, intent(in) :: ny        ! 2d grid size if available
-    integer    ,      optional, intent(in) :: nt        ! time sample
-    real(r8),         optional, intent(in) :: fillval   ! fill value
-    character(len=*), optional, intent(in) :: pre       ! prefix to variable name
-    logical,          optional, intent(in) :: tavg      ! is this a tavg
-    logical,          optional, intent(in) :: use_float ! write output as float rather than double
-    integer,          optional, intent(in) :: file_ind
-    integer,                    intent(out):: rc
+    type(file_desc_t)                       :: io_file
+    type(ESMF_FieldBundle)     , intent(in) :: FB        ! data to be written
+    logical                    , intent(in) :: whead     ! write header
+    logical                    , intent(in) :: wdata     ! write data
+    integer                    , intent(in) :: nx        ! 2d grid size if available
+    integer                    , intent(in) :: ny        ! 2d grid size if available
+    integer ,         optional , intent(in) :: nt        ! time sample
+    real(r8),         optional , intent(in) :: fillval   ! fill value
+    character(len=*), optional , intent(in) :: pre       ! prefix to variable name
+    character(len=*), optional , intent(in) :: flds(:)   ! specific fields to write out
+    logical,          optional , intent(in) :: tavg      ! is this a tavg
+    logical,          optional , intent(in) :: use_float ! write output as float rather than double
+    integer,          optional , intent(in) :: ntile     ! number of nx * ny tiles
+    integer                    , intent(out):: rc
 
     ! local variables
     type(ESMF_Field)              :: field
     type(ESMF_Mesh)               :: mesh
     type(ESMF_Distgrid)           :: distgrid
-    type(ESMF_VM)                 :: VM
-    integer                       :: mpicom
+    type(ESMF_CoordSys_Flag)      :: coordsys
     integer                       :: rcode
     integer                       :: nf,ns,ng
     integer                       :: k,n
     integer                       :: ndims, nelements
     integer    ,target            :: dimid2(2)
     integer    ,target            :: dimid3(3)
+    integer    ,target            :: dimid4(4)
     integer    ,pointer           :: dimid(:)
     type(var_desc_t)              :: varid
     type(io_desc_t)               :: iodesc
@@ -779,18 +741,17 @@ contains
     character(CL)                 :: itemc       ! string converted to char
     character(CL)                 :: name1       ! var name
     character(CL)                 :: cunit       ! var units
-    character(CL)                 :: lname       ! long name
-    character(CL)                 :: sname       ! standard name
     character(CL)                 :: lpre        ! local prefix
-    logical                       :: lwhead, lwdata
+    character(CS)                 :: coordvarnames(2)   ! coordinate variable names
+    character(CS)                 :: coordnames(2)      ! coordinate long names
+    character(CS)                 :: coordunits(2)      ! coordinate units
+    integer                       :: lnx,lny,lntile
     logical                       :: luse_float
-    integer                       :: lnx,lny
     real(r8)                      :: lfillvalue
     integer, pointer              :: minIndexPTile(:,:)
     integer, pointer              :: maxIndexPTile(:,:)
     integer                       :: dimCount, tileCount
     integer, pointer              :: Dof(:)
-    integer                       :: lfile_ind
     real(r8), pointer             :: fldptr1(:)
     real(r8), pointer             :: fldptr2(:,:)
     real(r8), allocatable         :: ownedElemCoords(:), ownedElemCoords_x(:), ownedElemCoords_y(:)
@@ -800,147 +761,171 @@ contains
     integer                       :: rank
     integer                       :: ungriddedUBound(1) ! currently the size must equal 1 for rank 2 fields
     integer                       :: gridToFieldMap(1)  ! currently the size must equal 1 for rank 2 fields
-    logical                       :: isPresent
+    logical                       :: tiles
+    character(CL), allocatable    :: fieldNameList(:)
     character(*),parameter :: subName = '(med_io_write_FB) '
     !-------------------------------------------------------------------------------
 
-    if (dbug_flag > 5) then
-       call ESMF_LogWrite(trim(subname)//": called", ESMF_LOGMSG_INFO)
-    endif
     rc = ESMF_Success
 
     lfillvalue = fillvalue
-    if (present(fillval)) then
-       lfillvalue = fillval
-    endif
-
+    if (present(fillval)) lfillvalue = fillval
     lpre = ' '
-    if (present(pre)) then
-       lpre = trim(pre)
-    endif
+    if (present(pre)) lpre = trim(pre)
+    luse_float = .false.
+    if (present(use_float)) luse_float = use_float
 
+    tiles = .false.
+    if (present(ntile)) then
+      if (ntile > 0) tiles = .true.
+    end if
+
+    ! Error check
     if (.not. ESMF_FieldBundleIsCreated(FB, rc=rc)) then
        call ESMF_LogWrite(trim(subname)//" FB "//trim(lpre)//" not created", ESMF_LOGMSG_INFO)
        if (dbug_flag > 5) then
           call ESMF_LogWrite(trim(subname)//": done", ESMF_LOGMSG_INFO)
        endif
-       rc = ESMF_Success
        return
     endif
 
-    lwhead = .true.
-    lwdata = .true.
-    if (present(whead)) lwhead = whead
-    if (present(wdata)) lwdata = wdata
-
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       if (dbug_flag > 5) then
-          call ESMF_LogWrite(trim(subname)//": done", ESMF_LOGMSG_INFO)
+    ! Get number of fields
+    if (present(flds)) then
+       nf = size(flds)
+    else
+       call ESMF_FieldBundleGet(FB, fieldCount=nf, rc=rc)
+       write(tmpstr,*) subname//' field count = '//trim(lpre), nf
+       call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
+       if (nf < 1) then
+          call ESMF_LogWrite(trim(subname)//" FB "//trim(lpre)//" empty", ESMF_LOGMSG_INFO)
+          if (dbug_flag > 5) then
+             call ESMF_LogWrite(trim(subname)//": done", ESMF_LOGMSG_INFO)
+          endif
+          rc = ESMF_Success
+          return
        endif
-       return
-    endif
+       allocate(fieldNameList(nf))
+       call ESMF_FieldBundleGet(FB, fieldNameList=fieldNameList, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+    end if
 
-    luse_float = .false.
-    if (present(use_float)) luse_float = use_float
-
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-
-    call ESMF_FieldBundleGet(FB, fieldCount=nf, rc=rc)
-    write(tmpstr,*) subname//' field count = '//trim(lpre),nf
-    call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
-    if (nf < 1) then
-       call ESMF_LogWrite(trim(subname)//" FB "//trim(lpre)//" empty", ESMF_LOGMSG_INFO)
-       if (dbug_flag > 5) then
-          call ESMF_LogWrite(trim(subname)//": done", ESMF_LOGMSG_INFO)
-       endif
-       rc = ESMF_Success
-       return
-    endif
-
+    ! Get field bundle mesh from first field
     call FB_getFieldN(FB, 1, field, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
-
     call ESMF_FieldGet(field, mesh=mesh, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
 
-    call ESMF_MeshGet(mesh, elementDistgrid=distgrid, rc=rc)
+    ! Get mesh distgrid and number of elements
+    call ESMF_MeshGet(mesh, elementDistgrid=distgrid, coordSys=coordsys, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
-
     call ESMF_MeshGet(mesh, spatialDim=ndims, numOwnedElements=nelements, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
-
     write(tmpstr,*) subname, 'ndims, nelements = ', ndims, nelements
     call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
+    ! Define coordinate attributes according to CoordSys
+    if (coordsys == ESMF_COORDSYS_CART) then
+       coordvarnames(1) = trim(lpre)//'_x'
+       coordvarnames(2) = trim(lpre)//'_y'
+       coordnames = (/'x-coordinate', 'y-coordinate'/)
+       coordunits = (/'unitless','unitless'/)
+    else
+       coordvarnames(1) = trim(lpre)//'_lon'
+       coordvarnames(2) = trim(lpre)//'_lat'
+       coordnames = (/'longitude', 'latitude '/)
+       if (coordsys == ESMF_COORDSYS_SPH_DEG) coordunits = (/'degrees_E', 'degrees_N'/)
+       if (coordsys == ESMF_COORDSYS_SPH_RAD) coordunits = (/'radians  ', 'radians  '/)
+    end if
 
+    ! Set element coordinates
     if (.not. allocated(ownedElemCoords) .and. ndims > 0 .and. nelements > 0) then
        allocate(ownedElemCoords(ndims*nelements))
        allocate(ownedElemCoords_x(ndims*nelements/2))
        allocate(ownedElemCoords_y(ndims*nelements/2))
-
        call ESMF_MeshGet(mesh, ownedElemCoords=ownedElemCoords, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-
        ownedElemCoords_x = ownedElemCoords(1::2)
        ownedElemCoords_y = ownedElemCoords(2::2)
     end if
 
+    ! Get tile info
     call ESMF_DistGridGet(distgrid, dimCount=dimCount, tileCount=tileCount, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
-
     allocate(minIndexPTile(dimCount, tileCount), maxIndexPTile(dimCount, tileCount))
     call ESMF_DistGridGet(distgrid, minIndexPTile=minIndexPTile, maxIndexPTile=maxIndexPTile, rc=rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
 
     ! write(tmpstr,*) subname,' counts = ',dimcount,tilecount,minindexptile,maxindexptile
     ! call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
-
     ! TODO: this is not getting the global size correct for a FB coming in that does not have
     ! all the global grid values in the distgrid - e.g. CTSM
 
     ng = maxval(maxIndexPTile)
-    lnx = ng
-    lny = 1
+    if (tiles) then
+       lnx = ng
+       lny = 1
+       lntile = 1
+       if (nx > 0) lnx = nx
+       if (ny > 0) lny = ny
+       if (ntile > 0) lntile = ntile
+       write(tmpstr,*) subname, 'ng,lnx,lny,lntile = ',ng,lnx,lny,lntile
+       call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
+       if (lnx*lny*lntile /= ng) then
+          write(tmpstr,*) subname,' ERROR: grid size not consistent ',ng,lnx,lny,lntile
+          call shr_log_error(trim(tmpstr), rc=rc)
+          return
+       end if
+    else
+       lnx = ng
+       lny = 1
+       if (nx > 0) lnx = nx
+       if (ny > 0) lny = ny
+       if (lnx*lny /= ng) then
+          write(tmpstr,*) subname,' WARNING: grid2d size not consistent ',ng,lnx,lny
+          call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
+       endif
+    end if
     deallocate(minIndexPTile, maxIndexPTile)
 
-    frame = -1
     if (present(nt)) then
        frame = nt
-    endif
-    if (present(nx)) then
-       if (nx > 0) lnx = nx
-    endif
-    if (present(ny)) then
-       if (ny > 0) lny = ny
-    endif
-    if (lnx*lny /= ng) then
-       write(tmpstr,*) subname,' ERROR: grid2d size not consistent ',ng,lnx,lny
-       call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
+    else
+       frame = -1
+    end if
 
-       !TODO: this should not be an error for say CTSM which does not send a global grid
-       !rc = ESMF_FAILURE
-       !return
-    endif
-
-    if (lwhead) then
-       rcode = pio_def_dim(io_file(lfile_ind),trim(lpre)//'_nx',lnx,dimid2(1))
-       rcode = pio_def_dim(io_file(lfile_ind),trim(lpre)//'_ny',lny,dimid2(2))
-
+    ! Write header
+    if (whead) then
+      if (tiles) then
+       rcode = pio_def_dim(io_file, trim(lpre)//'_nx', lnx, dimid3(1))
+       rcode = pio_def_dim(io_file, trim(lpre)//'_ny', lny, dimid3(2))
+       rcode = pio_def_dim(io_file, trim(lpre)//'_ntile', lntile, dimid3(3))
+       if (present(nt)) then
+          dimid4(1:3) = dimid3
+          rcode = pio_inq_dimid(io_file, 'time', dimid4(4))
+          dimid => dimid4
+       else
+          dimid => dimid3
+       endif
+      else
+       rcode = pio_def_dim(io_file, trim(lpre)//'_nx', lnx, dimid2(1))
+       rcode = pio_def_dim(io_file, trim(lpre)//'_ny', lny, dimid2(2))
        if (present(nt)) then
           dimid3(1:2) = dimid2
-          rcode = pio_inq_dimid(io_file(lfile_ind),'time',dimid3(3))
+          rcode = pio_inq_dimid(io_file, 'time', dimid3(3))
           dimid => dimid3
        else
           dimid => dimid2
        endif
-
-       write(tmpstr,*) subname,' dimid = ',dimid
-       call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
+      endif
+      write(tmpstr,*) subname,' dimid = ',dimid
+      call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
 
        do k = 1,nf
-          call FB_getNameN(FB, k, itemc, rc=rc)
-          if (chkerr(rc,__LINE__,u_FILE_u)) return
+          ! Determine field name
+          if (present(flds)) then
+             itemc = trim(flds(k))
+          else
+             itemc = trim(fieldNameList(k))
+          end if
 
           ! Determine rank of field with name itemc
           call ESMF_FieldBundleGet(FB, itemc,  field=lfield, rc=rc)
@@ -964,21 +949,21 @@ contains
                       name1 = trim(lpre)//'_'//trim(itemc)//trim(cnumber)
                       call ESMF_LogWrite(trim(subname)//': defining '//trim(name1), ESMF_LOGMSG_INFO)
                       if (luse_float) then
-                         rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_REAL, dimid, varid)
-                         rcode = pio_put_att(io_file(lfile_ind), varid,"_FillValue",real(lfillvalue,r4))
+                         rcode = pio_def_var(io_file, trim(name1), PIO_REAL, dimid, varid)
+                         rcode = pio_put_att(io_file, varid,"_FillValue",real(lfillvalue,r4))
                       else
-                         rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_DOUBLE, dimid, varid)
-                         rcode = pio_put_att(io_file(lfile_ind),varid,"_FillValue",lfillvalue)
+                         rcode = pio_def_var(io_file, trim(name1), PIO_DOUBLE, dimid, varid)
+                         rcode = pio_put_att(io_file,varid,"_FillValue",lfillvalue)
                       end if
                       if (NUOPC_FieldDictionaryHasEntry(trim(itemc))) then
                          call NUOPC_FieldDictionaryGetEntry(itemc, canonicalUnits=cunit, rc=rc)
                          if (chkerr(rc,__LINE__,u_FILE_u)) return
-                         rcode = pio_put_att(io_file(lfile_ind), varid, "units"        , trim(cunit))
+                         rcode = pio_put_att(io_file, varid, "units"        , trim(cunit))
                       end if
-                      rcode = pio_put_att(io_file(lfile_ind), varid, "standard_name", trim(name1))
+                      rcode = pio_put_att(io_file, varid, "standard_name", trim(name1))
                       if (present(tavg)) then
                          if (tavg) then
-                            rcode = pio_put_att(io_file(lfile_ind), varid, "cell_methods", "time: mean")
+                            rcode = pio_put_att(io_file, varid, "cell_methods", "time: mean")
                          endif
                       endif
                    end if
@@ -987,21 +972,21 @@ contains
                 name1 = trim(lpre)//'_'//trim(itemc)
                 call ESMF_LogWrite(trim(subname)//':'//trim(itemc)//':'//trim(name1),ESMF_LOGMSG_INFO)
                 if (luse_float) then
-                   rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_REAL, dimid, varid)
-                   rcode = pio_put_att(io_file(lfile_ind), varid, "_FillValue", real(lfillvalue, r4))
+                   rcode = pio_def_var(io_file, trim(name1), PIO_REAL, dimid, varid)
+                   rcode = pio_put_att(io_file, varid, "_FillValue", real(lfillvalue, r4))
                 else
-                   rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_DOUBLE, dimid, varid)
-                   rcode = pio_put_att(io_file(lfile_ind), varid, "_FillValue", lfillvalue)
+                   rcode = pio_def_var(io_file, trim(name1), PIO_DOUBLE, dimid, varid)
+                   rcode = pio_put_att(io_file, varid, "_FillValue", lfillvalue)
                 end if
                 if (NUOPC_FieldDictionaryHasEntry(trim(itemc))) then
                    call NUOPC_FieldDictionaryGetEntry(itemc, canonicalUnits=cunit, rc=rc)
                    if (chkerr(rc,__LINE__,u_FILE_u)) return
-                   rcode = pio_put_att(io_file(lfile_ind), varid, "units", trim(cunit))
+                   rcode = pio_put_att(io_file, varid, "units", trim(cunit))
                 end if
-                rcode = pio_put_att(io_file(lfile_ind), varid, "standard_name", trim(name1))
+                rcode = pio_put_att(io_file, varid, "standard_name", trim(name1))
                 if (present(tavg)) then
                    if (tavg) then
-                      rcode = pio_put_att(io_file(lfile_ind), varid, "cell_methods", "time: mean")
+                      rcode = pio_put_att(io_file, varid, "cell_methods", "time: mean")
                    endif
                 end if
              end if
@@ -1009,33 +994,19 @@ contains
        end do
 
        ! Add coordinate information to file
-       name1 = trim(lpre)//'_lon'
-       if (luse_float) then
-          rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_REAL, dimid, varid)
-       else
-          rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_DOUBLE, dimid, varid)
-       end if
-       rcode = pio_put_att(io_file(lfile_ind), varid, "long_name", "longitude")
-       rcode = pio_put_att(io_file(lfile_ind), varid, "units", "degrees_east")
-       rcode = pio_put_att(io_file(lfile_ind), varid, "standard_name", "longitude")
-
-       name1 = trim(lpre)//'_lat'
-       if (luse_float) then
-          rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_REAL, dimid, varid)
-       else
-          rcode = pio_def_var(io_file(lfile_ind), trim(name1), PIO_DOUBLE, dimid, varid)
-       end if
-       rcode = pio_put_att(io_file(lfile_ind), varid, "long_name", "latitude")
-       rcode = pio_put_att(io_file(lfile_ind), varid, "units", "degrees_north")
-       rcode = pio_put_att(io_file(lfile_ind), varid, "standard_name", "latitude")
-
-       ! Finish define mode
-       if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
-
+       do n = 1,ndims
+          if (luse_float) then
+             rcode = pio_def_var(io_file, trim(coordvarnames(n)), PIO_REAL, dimid, varid)
+          else
+             rcode = pio_def_var(io_file, trim(coordvarnames(n)), PIO_DOUBLE, dimid, varid)
+          end if
+          rcode = pio_put_att(io_file, varid, "long_name", trim(coordnames(n)))
+          rcode = pio_put_att(io_file, varid, "units", trim(coordunits(n)))
+          rcode = pio_put_att(io_file, varid, "standard_name", trim(coordnames(n)))
+       end do
     end if
 
-    if (lwdata) then
-
+    if (wdata) then
        ! use distgrid extracted from field 1 above
        call ESMF_DistGridGet(distgrid, localDE=0, elementCount=ns, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
@@ -1043,17 +1014,30 @@ contains
        call ESMF_DistGridGet(distgrid, localDE=0, seqIndexList=dof, rc=rc)
        write(tmpstr,*) subname,' dof = ',ns,size(dof),dof(1),dof(ns)  !,minval(dof),maxval(dof)
        call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
-
-       call pio_initdecomp(io_subsystem, pio_double, (/lnx,lny/), dof, iodesc)
-
-       ! call pio_writedof(lpre, (/lnx,lny/), int(dof,kind=PIO_OFFSET_KIND), mpicom)
-
+       if (tiles) then
+          if (luse_float) then
+             call pio_initdecomp(io_subsystem, pio_real, (/lnx,lny,lntile/), dof, iodesc)
+          else
+             call pio_initdecomp(io_subsystem, pio_double, (/lnx,lny,lntile/), dof, iodesc)
+          end if
+       else
+          if (luse_float) then
+             call pio_initdecomp(io_subsystem, pio_real, (/lnx,lny/), dof, iodesc)
+          else
+             call pio_initdecomp(io_subsystem, pio_double, (/lnx,lny/), dof, iodesc)
+          end if
+          !call pio_writedof(lpre, (/lnx,lny/), int(dof,kind=PIO_OFFSET_KIND), mpicom)
+       end if
        deallocate(dof)
 
        do k = 1,nf
-          call FB_getNameN(FB, k, itemc, rc=rc)
-          if (chkerr(rc,__LINE__,u_FILE_u)) return
- 
+          ! Determine field name
+          if (present(flds)) then
+             itemc = trim(flds(k))
+          else
+             itemc = trim(fieldNameList(k))
+          end if
+
           call FB_getFldPtr(FB, itemc, &
                fldptr1=fldptr1, fldptr2=fldptr2, rank=rank, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
@@ -1072,38 +1056,66 @@ contains
                 do n = 1,ungriddedUBound(1)
                    write(cnumber,'(i0)') n
                    name1 = trim(lpre)//'_'//trim(itemc)//trim(cnumber)
-                   rcode = pio_inq_varid(io_file(lfile_ind), trim(name1), varid)
-                   call pio_setframe(io_file(lfile_ind),varid,frame)
+                   rcode = pio_inq_varid(io_file, trim(name1), varid)
+                   call pio_setframe(io_file,varid,frame)
 
-                   if (gridToFieldMap(1) == 1) then
-                      call pio_write_darray(io_file(lfile_ind), varid, iodesc, fldptr2(:,n), rcode, fillval=lfillvalue)
-                   else if (gridToFieldMap(1) == 2) then
-                      call pio_write_darray(io_file(lfile_ind), varid, iodesc, fldptr2(n,:), rcode, fillval=lfillvalue)
+                   if (luse_float) then
+                      if (gridToFieldMap(1) == 1) then
+                         call pio_write_darray(io_file, varid, iodesc, real(fldptr2(:,n),r4), rcode, fillval=real(lfillvalue,r4))
+                      else if (gridToFieldMap(1) == 2) then
+                         call pio_write_darray(io_file, varid, iodesc, real(fldptr2(n,:),r4), rcode, fillval=real(lfillvalue,r4))
+                      end if
+                   else
+                      if (gridToFieldMap(1) == 1) then
+                         call pio_write_darray(io_file, varid, iodesc, fldptr2(:,n), rcode, fillval=lfillvalue)
+                      else if (gridToFieldMap(1) == 2) then
+                         call pio_write_darray(io_file, varid, iodesc, fldptr2(n,:), rcode, fillval=lfillvalue)
+                      end if
                    end if
                 end do
-             else if (rank == 1) then
+             else if (rank == 1 .or. rank == 0) then
                 name1 = trim(lpre)//'_'//trim(itemc)
-                rcode = pio_inq_varid(io_file(lfile_ind), trim(name1), varid)
-                call pio_setframe(io_file(lfile_ind),varid,frame)
-                call pio_write_darray(io_file(lfile_ind), varid, iodesc, fldptr1, rcode, fillval=lfillvalue)
-             end if  ! end if rank is 2 or 1
+                rcode = pio_inq_varid(io_file, trim(name1), varid)
+                call pio_setframe(io_file,varid,frame)
+                ! fix for writing data on exchange grid, which has no data in some PETs
+                if (rank == 0) nullify(fldptr1)
+                if (luse_float) then
+                   call pio_write_darray(io_file, varid, iodesc, real(fldptr1,r4), rcode, fillval=real(lfillvalue,r4))
+                else
+                   call pio_write_darray(io_file, varid, iodesc, fldptr1, rcode, fillval=lfillvalue)
+                end if
+             end if  ! end if rank is 2 or 1 or 0
 
           end if ! end if not "hgt"
        end do  ! end loop over fields in FB
 
-       ! Fill coordinate variables
-       name1 = trim(lpre)//'_lon'
-       rcode = pio_inq_varid(io_file(lfile_ind), trim(name1), varid)
-       call pio_setframe(io_file(lfile_ind),varid,frame)
-       call pio_write_darray(io_file(lfile_ind), varid, iodesc, ownedElemCoords_x, rcode, fillval=lfillvalue)
+       ! Fill coordinate variables - why is this being done each time?
+       rcode = pio_inq_varid(io_file, trim(coordvarnames(1)), varid)
+       call pio_setframe(io_file,varid,frame)
+       if (luse_float) then
+          call pio_write_darray(io_file, varid, iodesc, real(ownedElemCoords_x,r4), rcode, fillval=real(lfillvalue,r4))
+       else
+          call pio_write_darray(io_file, varid, iodesc, ownedElemCoords_x, rcode, fillval=lfillvalue)
+       end if
 
-       name1 = trim(lpre)//'_lat'
-       rcode = pio_inq_varid(io_file(lfile_ind), trim(name1), varid)
-       call pio_setframe(io_file(lfile_ind),varid,frame)
-       call pio_write_darray(io_file(lfile_ind), varid, iodesc, ownedElemCoords_y, rcode, fillval=lfillvalue)
-
-       call pio_syncfile(io_file(lfile_ind))
-       call pio_freedecomp(io_file(lfile_ind), iodesc)
+       rcode = pio_inq_varid(io_file, trim(coordvarnames(2)), varid)
+       call pio_setframe(io_file,varid,frame)
+       if (luse_float) then
+          call pio_write_darray(io_file, varid, iodesc, real(ownedElemCoords_y,r4), rcode, fillval=real(lfillvalue,r4))
+       else
+          call pio_write_darray(io_file, varid, iodesc, ownedElemCoords_y, rcode, fillval=lfillvalue)
+       end if
+       call pio_syncfile(io_file)
+       call pio_freedecomp(io_file, iodesc)
+    endif
+    if(allocated(ownedElemCoords)) then
+       deallocate(ownedElemCoords)
+    endif
+    if(allocated(ownedElemCoords_x)) then
+       deallocate(ownedElemCoords_x)
+    endif
+    if(allocated(ownedElemCoords_y)) then
+       deallocate(ownedElemCoords_y)
     endif
 
     if (dbug_flag > 5) then
@@ -1113,7 +1125,7 @@ contains
   end subroutine med_io_write_FB
 
   !===============================================================================
-  subroutine med_io_write_int(filename, iam, idata, dname, whead, wdata, file_ind, rc)
+  subroutine med_io_write_int(io_file, idata, dname, whead, wdata, rc)
 
     use pio, only : var_desc_t, pio_def_var, pio_put_att, pio_int, pio_inq_varid, pio_put_var
 
@@ -1122,60 +1134,40 @@ contains
     !---------------
 
     ! intput/output variables
-    character(len=*) ,intent(in) :: filename ! file
-    integer          ,intent(in) :: iam      ! local pet
+    type(file_desc_t)            :: io_file
     integer          ,intent(in) :: idata    ! data to be written
     character(len=*) ,intent(in) :: dname    ! name of data
-    logical,optional ,intent(in) :: whead    ! write header
-    logical,optional ,intent(in) :: wdata    ! write data
-    integer,optional ,intent(in) :: file_ind
+    logical          ,intent(in) :: whead    ! write header
+    logical          ,intent(in) :: wdata    ! write data
     integer          ,intent(out):: rc
 
     ! local variables
     integer          :: rcode
     type(var_desc_t) :: varid
     character(CL)    :: cunit       ! var units
-    logical          :: lwhead, lwdata
-    integer          :: lfile_ind
     character(*),parameter :: subName = '(med_io_write_int) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lwhead = .true.
-    lwdata = .true.
-    if (present(whead)) lwhead = whead
-    if (present(wdata)) lwdata = wdata
-
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       return
-    endif
-
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-
-    if (lwhead) then
+    if (whead) then
        if (NUOPC_FieldDictionaryHasEntry(trim(dname))) then
           call NUOPC_FieldDictionaryGetEntry(dname, canonicalUnits=cunit, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
-          rcode = pio_put_att(io_file(lfile_ind),varid,"units",trim(cunit))
+          rcode = pio_put_att(io_file,varid,"units",trim(cunit))
        end if
-       rcode = pio_def_var(io_file(lfile_ind),trim(dname),PIO_INT,varid)
-       rcode = pio_put_att(io_file(lfile_ind),varid,"standard_name",trim(dname))
-       if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
+       rcode = pio_def_var(io_file,trim(dname),PIO_INT,varid)
+       rcode = pio_put_att(io_file,varid,"standard_name",trim(dname))
     endif
-
-    if (lwdata) then
-       rcode = pio_inq_varid(io_file(lfile_ind),trim(dname),varid)
-       rcode = pio_put_var(io_file(lfile_ind),varid,idata)
-       !      write(logunit,*) subname,' wrote AV ',trim(dname),lwhead,lwdata
+    if (wdata) then
+       rcode = pio_inq_varid(io_file,trim(dname),varid)
+       rcode = pio_put_var(io_file,varid,idata)
     endif
 
   end subroutine med_io_write_int
 
   !===============================================================================
-  subroutine med_io_write_int1d(filename, iam, idata, dname, whead, wdata, file_ind, rc)
+  subroutine med_io_write_int1d(io_file, idata, dname, whead, wdata, file_ind, rc)
 
     !---------------
     ! Write 1d integer array to netcdf file
@@ -1186,67 +1178,48 @@ contains
     use pio     , only : pio_int, pio_def_var
 
     ! input/output arguments
-    character(len=*),intent(in) :: filename ! file
-    integer         ,intent(in) :: iam      ! local pet
-    integer         ,intent(in) :: idata(:) ! data to be written
-    character(len=*),intent(in) :: dname    ! name of data
-    logical,optional,intent(in) :: whead    ! write header
-    logical,optional,intent(in) :: wdata    ! write data
-    integer,optional,intent(in) :: file_ind
-    integer         , intent(out) :: rc
+    type(file_desc_t)            :: io_file
+    integer          ,intent(in) :: idata(:) ! data to be written
+    character(len=*) ,intent(in) :: dname    ! name of data
+    logical          ,intent(in) :: whead    ! write header
+    logical          ,intent(in) :: wdata    ! write data
+    integer,optional ,intent(in) :: file_ind
+    integer         , intent(out):: rc
 
     ! local variables
     integer          :: rcode
     integer          :: dimid(1)
     type(var_desc_t) :: varid
     character(CL)    :: cunit       ! var units
-    character(CL)    :: lname       ! long name
-    character(CL)    :: sname       ! standard name
     integer          :: lnx
-    logical          :: lwhead, lwdata
     integer          :: lfile_ind
     character(*),parameter :: subName = '(med_io_write_int1d) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lwhead = .true.
-    lwdata = .true.
-    if (present(whead)) lwhead = whead
-    if (present(wdata)) lwdata = wdata
-
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       return
-    endif
-
     lfile_ind = 0
     if (present(file_ind)) lfile_ind=file_ind
 
-    if (lwhead) then
+    if (whead) then
        if (NUOPC_FieldDictionaryHasEntry(trim(dname))) then
           call NUOPC_FieldDictionaryGetEntry(dname, canonicalUnits=cunit, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
-          rcode = pio_put_att(io_file(lfile_ind),varid,"units",trim(cunit))
+          rcode = pio_put_att(io_file,varid,"units",trim(cunit))
        end if
        lnx = size(idata)
-       rcode = pio_def_dim(io_file(lfile_ind),trim(dname)//'_nx',lnx,dimid(1))
-       rcode = pio_def_var(io_file(lfile_ind),trim(dname),PIO_INT,dimid,varid)
-       rcode = pio_put_att(io_file(lfile_ind),varid,"standard_name",trim(dname))
-       if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
+       rcode = pio_def_dim(io_file,trim(dname),lnx,dimid(1))
+       rcode = pio_def_var(io_file,trim(dname),PIO_INT,dimid,varid)
+       rcode = pio_put_att(io_file,varid,"standard_name",trim(dname))
+    else if (wdata) then
+       rcode = pio_inq_varid(io_file,trim(dname),varid)
+       rcode = pio_put_var(io_file,varid,idata)
     endif
-
-    if (lwdata) then
-       rcode = pio_inq_varid(io_file(lfile_ind),trim(dname),varid)
-       rcode = pio_put_var(io_file(lfile_ind),varid,idata)
-    endif
-
-    !      write(logunit,*) subname,' wrote AV ',trim(dname),lwhead,lwdata
 
   end subroutine med_io_write_int1d
 
   !===============================================================================
-  subroutine med_io_write_r8(filename, iam, rdata, dname, whead, wdata, file_ind, rc)
+  subroutine med_io_write_r8(io_file, rdata, dname, whead, wdata, rc)
 
     !---------------
     ! Write scalar double to netcdf file
@@ -1256,60 +1229,41 @@ contains
     use pio , only : pio_double, pio_noerr, pio_inq_varid, pio_put_var
 
     ! input/output arguments
-    character(len=*),intent(in) :: filename ! file
-    integer         ,intent(in) :: iam      ! local pet
-    real(r8)        ,intent(in) :: rdata    ! data to be written
-    character(len=*),intent(in) :: dname    ! name of data
-    logical,optional,intent(in) :: whead    ! write header
-    logical,optional,intent(in) :: wdata    ! write data
-    integer,optional,intent(in) :: file_ind
-    integer         ,intent(out):: rc
+    type(file_desc_T)            :: io_file
+    real(r8)         ,intent(in) :: rdata    ! data to be written
+    character(len=*) ,intent(in) :: dname    ! name of data
+    logical          ,intent(in) :: whead    ! write header
+    logical          ,intent(in) :: wdata    ! write data
+    integer          ,intent(out):: rc
 
     ! local variables
     integer          :: rcode
     type(var_desc_t) :: varid
     character(CL)    :: cunit       ! var units
-    logical          :: lwhead, lwdata
-    integer          :: lfile_ind
     character(*),parameter :: subName = '(med_io_write_r8) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lwhead = .true.
-    if (present(whead)) lwhead = whead
-    lwdata = .true.
-    if (present(wdata)) lwdata = wdata
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       return
-    endif
-
-    if (lwhead) then
-       rcode = pio_def_var(io_file(lfile_ind),trim(dname),PIO_DOUBLE,varid)
+    if (whead) then
+       rcode = pio_def_var(io_file,trim(dname),PIO_DOUBLE,varid)
        if (rcode==PIO_NOERR) then
           if (NUOPC_FieldDictionaryHasEntry(trim(dname))) then
              call NUOPC_FieldDictionaryGetEntry(dname, canonicalUnits=cunit, rc=rc)
              if (chkerr(rc,__LINE__,u_FILE_u)) return
-             rcode = pio_put_att(io_file(lfile_ind),varid,"units",trim(cunit))
+             rcode = pio_put_att(io_file,varid,"units",trim(cunit))
           end if
-          rcode = pio_put_att(io_file(lfile_ind),varid,"standard_name",trim(dname))
-          if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
+          rcode = pio_put_att(io_file,varid,"standard_name",trim(dname))
        end if
-    endif
-
-    if (lwdata) then
-       rcode = pio_inq_varid(io_file(lfile_ind),trim(dname),varid)
-       rcode = pio_put_var(io_file(lfile_ind),varid,rdata)
+    else if (wdata) then
+       rcode = pio_inq_varid(io_file,trim(dname),varid)
+       rcode = pio_put_var(io_file,varid,rdata)
     endif
 
   end subroutine med_io_write_r8
 
   !===============================================================================
-  subroutine med_io_write_r81d(filename, iam, rdata, dname, whead, wdata, file_ind, rc)
+  subroutine med_io_write_r81d(io_file, rdata, dname, whead, wdata, rc)
 
     !---------------
     ! Write 1d double array to netcdf file
@@ -1319,14 +1273,12 @@ contains
     use pio , only : pio_inq_varid, pio_put_var, pio_double, pio_put_att
 
     ! !INPUT/OUTPUT PARAMETERS:
-    character(len=*),intent(in) :: filename ! file
-    integer         ,intent(in) :: iam
-    real(r8)        ,intent(in) :: rdata(:) ! data to be written
-    character(len=*),intent(in) :: dname    ! name of data
-    logical,optional,intent(in) :: whead    ! write header
-    logical,optional,intent(in) :: wdata    ! write data
-    integer,optional,intent(in) :: file_ind
-    integer         ,intent(out):: rc
+    type(file_desc_t)            :: io_file
+    real(r8)         ,intent(in) :: rdata(:) ! data to be written
+    character(len=*) ,intent(in) :: dname    ! name of data
+    logical          ,intent(in) :: whead    ! write header
+    logical          ,intent(in) :: wdata    ! write data
+    integer          ,intent(out):: rc
 
     ! local variables
     integer          :: rcode
@@ -1334,47 +1286,32 @@ contains
     type(var_desc_t) :: varid
     character(CL)    :: cunit       ! var units
     integer          :: lnx
-    logical          :: lwhead, lwdata
-    integer          :: lfile_ind
     character(*),parameter :: subName = '(med_io_write_r81d) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lwhead = .true.
-    if (present(whead)) lwhead = whead
-    lwdata = .true.
-    if (present(wdata)) lwdata = wdata
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       return
-    endif
-
-    if (lwhead) then
+    if (whead) then
        lnx = size(rdata)
-       rcode = pio_def_dim(io_file(lfile_ind),trim(dname)//'_nx',lnx,dimid(1))
-       rcode = pio_def_var(io_file(lfile_ind),trim(dname),PIO_DOUBLE,dimid,varid)
+       rcode = pio_def_dim(io_file,trim(dname)//'_nx',lnx,dimid(1))
+       rcode = pio_def_var(io_file,trim(dname),PIO_DOUBLE,dimid,varid)
        if (NUOPC_FieldDictionaryHasEntry(trim(dname))) then
           call NUOPC_FieldDictionaryGetEntry(dname, canonicalUnits=cunit, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
-          rcode = pio_put_att(io_file(lfile_ind),varid,"units",trim(cunit))
+          rcode = pio_put_att(io_file,varid,"units",trim(cunit))
        end if
-       rcode = pio_put_att(io_file(lfile_ind),varid,"standard_name",trim(dname))
-       if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
+       rcode = pio_put_att(io_file,varid,"standard_name",trim(dname))
     endif
 
-    if (lwdata) then
-       rcode = pio_inq_varid(io_file(lfile_ind),trim(dname),varid)
-       rcode = pio_put_var(io_file(lfile_ind),varid,rdata)
+    if (wdata) then
+       rcode = pio_inq_varid(io_file,trim(dname),varid)
+       rcode = pio_put_var(io_file,varid,rdata)
     endif
 
   end subroutine med_io_write_r81d
 
   !===============================================================================
-  subroutine med_io_write_char(filename, iam, rdata, dname, whead, wdata, file_ind, rc)
+  subroutine med_io_write_char(io_file, rdata, dname, whead, wdata, rc)
 
     !---------------
     ! Write char string to netcdf file
@@ -1384,72 +1321,48 @@ contains
     use pio , only : pio_char, pio_put_var
 
     ! input/output arguments
-    character(len=*),intent(in) :: filename ! file
-    integer         ,intent(in) :: iam      ! local pet
-    character(len=*),intent(in) :: rdata    ! data to be written
-    character(len=*),intent(in) :: dname    ! name of data
-    logical,optional,intent(in) :: whead    ! write header
-    logical,optional,intent(in) :: wdata    ! write data
-    integer,optional,intent(in) :: file_ind
-    integer         ,intent(out):: rc
+    type(file_desc_t)            :: io_file
+    character(len=*) ,intent(in) :: rdata    ! data to be written
+    character(len=*) ,intent(in) :: dname    ! name of data
+    logical          ,intent(in) :: whead    ! write header
+    logical          ,intent(in) :: wdata    ! write data
+    integer          ,intent(out):: rc
 
     ! local variables
     integer          :: rcode
     integer          :: dimid(1)
     type(var_desc_t) :: varid
     character(CL)    :: cunit       ! var units
-    character(CL)    :: lname       ! long name
-    character(CL)    :: sname       ! standard name
     integer          :: lnx
-    logical          :: lwhead, lwdata
-    integer          :: lfile_ind
     character(CL)    :: charvar   ! buffer for string read/write
     character(*),parameter :: subName = '(med_io_write_char) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lwhead = .true.
-    if (present(whead)) lwhead = whead
-    lwdata = .true.
-    if (present(wdata)) lwdata = wdata
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       return
-    endif
-
-    if (lwhead) then
+    if (whead) then
        lnx = len(charvar)
-       rcode = pio_def_dim(io_file(lfile_ind),trim(dname)//'_len',lnx,dimid(1))
-       rcode = pio_def_var(io_file(lfile_ind),trim(dname),PIO_CHAR,dimid,varid)
+       rcode = pio_def_dim(io_file,trim(dname)//'_len',lnx,dimid(1))
+       rcode = pio_def_var(io_file,trim(dname),PIO_CHAR,dimid,varid)
        if (NUOPC_FieldDictionaryHasEntry(trim(dname))) then
           call NUOPC_FieldDictionaryGetEntry(dname, canonicalUnits=cunit, rc=rc)
           if (chkerr(rc,__LINE__,u_FILE_u)) return
        end if
-       rcode = pio_put_att(io_file(lfile_ind),varid,"standard_name",trim(dname))
-       if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
-    endif
-    if (lwdata) then
+       rcode = pio_put_att(io_file,varid,"standard_name",trim(dname))
+    else if (wdata) then
        charvar = ''
        charvar = trim(rdata)
-       rcode = pio_inq_varid(io_file(lfile_ind),trim(dname),varid)
-       rcode = pio_put_var(io_file(lfile_ind),varid,charvar)
+       rcode = pio_inq_varid(io_file,trim(dname),varid)
+       rcode = pio_put_var(io_file,varid,charvar)
     endif
 
   end subroutine med_io_write_char
 
   !===============================================================================
-  subroutine med_io_write_time(filename, iam, time_units, calendar, time_val, nt,&
-       whead, wdata, tbnds, file_ind, rc)
+  subroutine med_io_define_time(io_file, time_units, calendar, rc)
 
-    !---------------
-    ! Write time variable to netcdf file
-    !---------------
-
-    use ESMF, only : operator(==)
-    use ESMF, only : ESMF_Calendar
+    use ESMF, only : operator(==), operator(/=)
+    use ESMF, only : ESMF_Calendar, ESMF_CalendarIsCreated
     use ESMF, only : ESMF_CALKIND_360DAY, ESMF_CALKIND_GREGORIAN
     use ESMF, only : ESMF_CALKIND_JULIAN, ESMF_CALKIND_JULIANDAY, ESMF_CALKIND_MODJULIANDAY
     use ESMF, only : ESMF_CALKIND_NOCALENDAR, ESMF_CALKIND_NOLEAP
@@ -1458,102 +1371,97 @@ contains
     use pio , only : pio_inq_varid, pio_put_var
 
     ! input/output variables
-    character(len=*)    ,           intent(in) :: filename   ! file
-    integer             ,           intent(in) :: iam        ! local pet
-    character(len=*)    ,           intent(in) :: time_units ! units of time
-    type(ESMF_Calendar) ,           intent(in) :: calendar   ! calendar
-    real(r8)            ,           intent(in) :: time_val   ! data to be written
-    integer             , optional, intent(in) :: nt
-    logical             , optional, intent(in) :: whead      ! write header
-    logical             , optional, intent(in) :: wdata      ! write data
-    real(r8)            , optional, intent(in) :: tbnds(2)   ! time bounds
-    integer             , optional, intent(in) :: file_ind
-    integer             ,           intent(out):: rc
+    type(file_desc_t)                :: io_file
+    character(len=*)    , intent(in) :: time_units ! units of time
+    type(ESMF_Calendar) , intent(in) :: calendar   ! calendar
+    integer             , intent(out):: rc
 
     ! local variables
     integer          :: rcode
     integer          :: dimid(1)
     integer          :: dimid2(2)
     type(var_desc_t) :: varid
-    logical          :: lwhead, lwdata
-    integer          :: start(4),count(4)
-    real(r8)         :: time_val_1d(1)
-    integer          :: lfile_ind
     character(CL)    :: calname        ! calendar name
+    character(*),parameter :: subName = '(med_io_define_time) '
+    !-------------------------------------------------------------------------------
+
+    rc = ESMF_SUCCESS
+
+    if (.not. ESMF_CalendarIsCreated(calendar)) then
+       call shr_log_error(trim(subname)//' ERROR: calendar is not created ', &
+            line=__LINE__, file=u_FILE_u, rc=rc)
+       return
+    end if
+
+    ! define time and add calendar attribute
+    rcode = pio_def_dim(io_file, 'time', PIO_UNLIMITED, dimid(1))
+    rcode = pio_def_var(io_file, 'time', PIO_DOUBLE, dimid, varid)
+    rcode = pio_put_att(io_file, varid, 'units', trim(time_units))
+    if (calendar == ESMF_CALKIND_360DAY) then
+       calname = '360_day'
+    else if (calendar == ESMF_CALKIND_GREGORIAN) then
+       calname = 'gregorian'
+    else if (calendar == ESMF_CALKIND_JULIAN) then
+       calname = 'julian'
+    else if (calendar == ESMF_CALKIND_JULIANDAY) then
+       calname = 'ESMF_CALKIND_JULIANDAY'
+    else if (calendar == ESMF_CALKIND_MODJULIANDAY) then
+       calname = 'ESMF_CALKIND_MODJULIANDAY'
+    else if (calendar == ESMF_CALKIND_NOCALENDAR) then
+       calname = 'none'
+    else if (calendar == ESMF_CALKIND_NOLEAP) then
+       calname = 'noleap'
+    end if
+    rcode = pio_put_att(io_file, varid, 'calendar', trim(calname))
+
+    ! define time bounds
+    dimid2(2) = dimid(1)
+    rcode = pio_def_dim(io_file, 'ntb', 2, dimid2(1))
+    rcode = pio_def_var(io_file, 'time_bnds', PIO_DOUBLE, dimid2, varid)
+    rcode = pio_put_att(io_file, varid, 'bounds', 'time_bnds')
+
+  end subroutine med_io_define_time
+
+  !===============================================================================
+  subroutine med_io_write_time(io_file, time_val, tbnds, nt, rc)
+
+    !---------------
+    ! Write time variable to netcdf file
+    !---------------
+
+    use pio, only : pio_put_att, pio_inq_varid, pio_put_var
+
+    ! input/output variables
+    type(file_desc_t)               :: io_file
+    real(r8) ,           intent(in) :: time_val   ! data to be written
+    real(r8) ,           intent(in) :: tbnds(2)   ! time bounds
+    integer  ,           intent(in) :: nt
+    integer  ,           intent(out):: rc
+
+    ! local variables
+    integer :: rcode
+    integer :: varid
+    integer :: start(2),count(2)
     character(*),parameter :: subName = '(med_io_write_time) '
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
 
-    lwhead = .true.
-    if (present(whead)) lwhead = whead
-    lwdata = .true.
-    if (present(wdata)) lwdata = wdata
-    lfile_ind = 0
-    if (present(file_ind)) lfile_ind=file_ind
-    if (.not.lwhead .and. .not.lwdata) then
-       ! should we write a warning?
-       return
-    endif
+    ! write time
+    count = 1; start = nt
+    rcode = pio_inq_varid(io_file, 'time', varid)
+    rcode = pio_put_var(io_file, varid, start(1:1), count(1:1), (/time_val/))
 
-    ! Write out header
-    if (lwhead) then
-       rcode = pio_def_dim(io_file(lfile_ind),'time',PIO_UNLIMITED,dimid(1))
-       rcode = pio_def_var(io_file(lfile_ind),'time',PIO_DOUBLE,dimid,varid)
-       rcode = pio_put_att(io_file(lfile_ind),varid,'units',trim(time_units))
-
-       if (calendar == ESMF_CALKIND_360DAY) then
-          calname = '360_day'
-       else if (calendar == ESMF_CALKIND_GREGORIAN) then
-          calname = 'gregorian'
-       else if (calendar == ESMF_CALKIND_JULIAN) then
-          calname = 'julian'
-       else if (calendar == ESMF_CALKIND_JULIANDAY) then
-          calname = 'ESMF_CALKIND_JULIANDAY'
-       else if (calendar == ESMF_CALKIND_MODJULIANDAY) then
-          calname = 'ESMF_CALKIND_MODJULIANDAY'
-       else if (calendar == ESMF_CALKIND_NOCALENDAR) then
-          calname = 'none'
-       else if (calendar == ESMF_CALKIND_NOLEAP) then
-          calname = 'noleap'
-       end if
-       rcode = pio_put_att(io_file(lfile_ind),varid,'calendar',trim(calname))
-
-       if (present(tbnds)) then
-          dimid2(2) = dimid(1)
-          rcode = pio_put_att(io_file(lfile_ind),varid,'bounds','time_bnds')
-          rcode = pio_def_dim(io_file(lfile_ind),'ntb',2,dimid2(1))
-          rcode = pio_def_var(io_file(lfile_ind),'time_bnds',PIO_DOUBLE,dimid2,varid)
-       endif
-       if (lwdata) call med_io_enddef(filename, file_ind=lfile_ind)
-    endif
-
-    ! Write out data
-    if (lwdata) then
-       start = 1
-       count = 1
-       if (present(nt)) then
-          start(1) = nt
-       endif
-       time_val_1d(1) = time_val
-       rcode = pio_inq_varid(io_file(lfile_ind),'time',varid)
-       rcode = pio_put_var(io_file(lfile_ind),varid,start,count,time_val_1d)
-       if (present(tbnds)) then
-          rcode = pio_inq_varid(io_file(lfile_ind),'time_bnds',varid)
-          start = 1
-          count = 1
-          if (present(nt)) then
-             start(2) = nt
-          endif
-          count(1) = 2
-          rcode = pio_put_var(io_file(lfile_ind),varid,start,count,tbnds)
-       endif
-    endif
+    ! write time bounds
+    rcode = pio_inq_varid(io_file, 'time_bnds', varid)
+    start(1) = 1; start(2) = nt
+    count(1) = 2; count(2) = 1
+    rcode = pio_put_var(io_file, varid, start(1:2), count(1:2), tbnds)
 
   end subroutine med_io_write_time
 
   !===============================================================================
-  subroutine med_io_read_FB(filename, vm, iam, FB, pre, frame, rc)
+  subroutine med_io_read_FB(filename, vm, FB, pre, frame, rc)
 
     !---------------
     ! Read FB from netcdf file
@@ -1561,7 +1469,6 @@ contains
 
     use ESMF , only : ESMF_FieldBundle, ESMF_Field, ESMF_Mesh, ESMF_DistGrid
     use ESMF , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_SUCCESS
-    use ESMF , only : ESMF_LOGMSG_ERROR, ESMF_FAILURE
     use ESMF , only : ESMF_FieldBundleIsCreated, ESMF_FieldBundleGet
     use ESMF , only : ESMF_FieldGet, ESMF_MeshGet, ESMF_DistGridGet
     use pio  , only : file_desc_T, var_desc_t, io_desc_t, pio_nowrite, pio_openfile
@@ -1571,9 +1478,8 @@ contains
     use pio  , only : pio_read_darray, pio_offset_kind, pio_setframe
 
     ! input/output arguments
-    character(len=*)                        ,intent(in)  :: filename ! file
+    character(len=*)                        ,intent(in)  :: filename
     type(ESMF_VM)                           ,intent(in)  :: vm
-    integer                                 ,intent(in)  :: iam
     type(ESMF_FieldBundle)                  ,intent(in)  :: FB       ! data to be read
     character(len=*)              ,optional ,intent(in)  :: pre      ! prefix to variable name
     integer(kind=PIO_OFFSET_KIND) ,optional ,intent(in)  :: frame
@@ -1582,7 +1488,7 @@ contains
     ! local variables
     type(ESMF_Field)              :: lfield
     integer                       :: rcode
-    integer                       :: nf,ns,ng
+    integer                       :: nf
     integer                       :: k,n,l
     type(file_desc_t)             :: pioid
     type(var_desc_t)              :: varid
@@ -1591,7 +1497,6 @@ contains
     character(CL)                 :: name1       ! var name
     character(CL)                 :: lpre        ! local prefix
     real(r8)                      :: lfillvalue
-    integer                       :: tmp(1)
     integer                       :: rank, lsize
     real(r8), pointer             :: fldptr1(:), fldptr1_tmp(:)
     real(r8), pointer             :: fldptr2(:,:)
@@ -1640,14 +1545,13 @@ contains
        return
     endif
 
-    if (med_io_file_exists(vm, iam, trim(filename))) then
+    if (med_io_file_exists(vm, trim(filename))) then
        rcode = pio_openfile(io_subsystem, pioid, pio_iotype, trim(filename),pio_nowrite)
        call ESMF_LogWrite(trim(subname)//' open file '//trim(filename), ESMF_LOGMSG_INFO)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
     else
-       call ESMF_LogWrite(trim(subname)//' ERROR: file invalid '//trim(filename), &
-       ESMF_LOGMSG_ERROR, line=__LINE__, file=u_FILE_u)
-       rc = ESMF_FAILURE
+       call shr_log_error(trim(subname)//' ERROR: file invalid '//trim(filename), &
+            line=__LINE__, file=u_FILE_u, rc=rc)
        return
     endif
 
@@ -1700,8 +1604,8 @@ contains
           allocate(fldptr1_tmp(lsize))
 
           do n = 1,ungriddedUBound(1)
-             ! Creat a name for the 1d field on the mediator history or restart file based on the
-             ! ungridded dimension index of the field bundle 2d fiedl
+             ! Create a name for the 1d field on the mediator history or restart file based on the
+             ! ungridded dimension index of the field bundle 2d field
              write(cnumber,'(i0)') n
              name1 = trim(lpre)//'_'//trim(itemc)//trim(cnumber)
 
@@ -1766,7 +1670,7 @@ contains
   !===============================================================================
   subroutine med_io_read_init_iodesc(FB, name1, pioid, iodesc, rc)
 
-    use ESMF , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_SUCCESS, ESMF_FAILURE
+    use ESMF , only : ESMF_LogWrite, ESMF_LOGMSG_INFO, ESMF_SUCCESS
     use ESMF , only : ESMF_FieldBundleIsCreated, ESMF_FieldBundle, ESMF_Mesh, ESMF_DistGrid
     use ESMF , only : ESMF_FieldBundleGet, ESMF_FieldGet, ESMF_MeshGet, ESMF_DistGridGet
     use ESMF , only : ESMF_Field, ESMF_FieldGet, ESMF_AttributeGet
@@ -1788,17 +1692,15 @@ contains
     type(ESMF_Distgrid) :: distgrid
     integer             :: rcode
     integer             :: ns,ng
-    integer             :: n,ndims
+    integer             :: ndims
     integer, pointer    :: dimid(:)
     type(var_desc_t)    :: varid
     integer             :: lnx,lny
-    integer             :: tmp(1)
     integer, pointer    :: minIndexPTile(:,:)
     integer, pointer    :: maxIndexPTile(:,:)
     integer             :: dimCount, tileCount
     integer, pointer    :: Dof(:)
     character(CL)       :: tmpstr
-    integer             :: rank
     character(*),parameter :: subName = '(med_io_read_init_iodesc) '
     !-------------------------------------------------------------------------------
 
@@ -1826,16 +1728,12 @@ contains
        write(tmpstr,*) trim(subname),' lny = ',lny
        call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
        ng = lnx * lny
-
        call FB_getFieldN(FB, 1, field, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-
        call ESMF_FieldGet(field, mesh=mesh, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-
        call ESMF_MeshGet(mesh, elementDistgrid=distgrid, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-
        call ESMF_DistGridGet(distgrid, dimCount=dimCount, tileCount=tileCount, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
 
@@ -1843,15 +1741,11 @@ contains
        call ESMF_DistGridGet(distgrid, minIndexPTile=minIndexPTile, &
             maxIndexPTile=maxIndexPTile, rc=rc)
        if (chkerr(rc,__LINE__,u_FILE_u)) return
-       !write(tmpstr,*) subname,' counts = ',dimcount,tilecount,minindexptile,maxindexptile
-       !call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
 
        if (ng > maxval(maxIndexPTile)) then
           write(tmpstr,*) subname,' WARNING: dimensions do not match', lnx, lny, maxval(maxIndexPTile)
           call ESMF_LogWrite(trim(tmpstr), ESMF_LOGMSG_INFO)
-          !TODO: this should not be an error for say CTSM which does not send a global grid
-          !rc = ESMF_Failure
-          !return
+          ! This should not be an error for say CTSM which does not send a global grid
        endif
 
        call ESMF_DistGridGet(distgrid, localDE=0, elementCount=ns, rc=rc)
@@ -1866,13 +1760,15 @@ contains
        deallocate(dof)
 
        deallocate(minIndexPTile, maxIndexPTile)
-
+    else
+       call shr_log_error(trim(subname)//' ERROR: '//trim(name1)//' is not present, aborting ', rc=rc)
+       return
     end if ! end if rcode check
 
   end subroutine med_io_read_init_iodesc
 
   !===============================================================================
-  subroutine med_io_read_int(filename, vm, iam, idata, dname, rc)
+  subroutine med_io_read_int(filename, vm, idata, dname, rc)
 
     !---------------
     ! Read scalar integer from netcdf file
@@ -1881,7 +1777,6 @@ contains
     ! input/output arguments
     character(len=*) , intent(in)    :: filename ! file
     type(ESMF_VM)                    :: vm
-    integer          , intent(in)    :: iam
     integer          , intent(inout) :: idata    ! integer data
     character(len=*) , intent(in)    :: dname    ! name of data
     integer          , intent(out)   :: rc
@@ -1892,14 +1787,14 @@ contains
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
-    call med_io_read_int1d(filename, vm, iam, i1d, dname, rc)
+    call med_io_read_int1d(filename, vm, i1d, dname, rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
     idata = i1d(1)
 
   end subroutine med_io_read_int
 
   !===============================================================================
-  subroutine med_io_read_int1d(filename, vm, iam, idata, dname, rc)
+  subroutine med_io_read_int1d(filename, vm, idata, dname, rc)
 
     !---------------
     ! Read 1d integer array from netcdf file
@@ -1913,7 +1808,6 @@ contains
     ! input/output arguments
     character(len=*), intent(in)    :: filename ! file
     type(ESMF_VM)                   :: vm
-    integer,          intent(in)    :: iam
     integer         , intent(inout) :: idata(:) ! integer data
     character(len=*), intent(in)    :: dname    ! name of data
     integer         , intent(out)   :: rc
@@ -1924,6 +1818,7 @@ contains
     type(var_desc_t)  :: varid
     character(CL)     :: lversion
     character(CL)     :: name1
+    integer           :: iam
     character(*),parameter :: subName = '(med_io_read_int1d) '
     !-------------------------------------------------------------------------------
 
@@ -1931,15 +1826,16 @@ contains
 
     lversion=trim(version)
 
-    if (med_io_file_exists(vm, iam, filename)) then
+    call ESMF_VMGet(vm, localPet=iam, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    if (med_io_file_exists(vm, filename)) then
        rcode = pio_openfile(io_subsystem, pioid, pio_iotype, trim(filename),pio_nowrite)
        call pio_seterrorhandling(pioid,PIO_BCAST_ERROR)
        rcode = pio_get_att(pioid,pio_global,"file_version",lversion)
        call pio_seterrorhandling(pioid,PIO_INTERNAL_ERROR)
     else
-       if(iam==0) write(logunit,*) subname,' ERROR: file invalid ',trim(filename),' ',trim(dname)
-       call ESMF_LogWrite(trim(subname)//'ERROR: file invalid '//trim(filename)//' '//trim(dname), ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
+       call shr_log_error(trim(subname)//'ERROR: file invalid '//trim(filename)//' '//trim(dname), rc=rc)
        return
     endif
 
@@ -1955,7 +1851,7 @@ contains
   end subroutine med_io_read_int1d
 
   !===============================================================================
-  subroutine med_io_read_r8(filename, vm, iam, rdata, dname, rc)
+  subroutine med_io_read_r8(filename, vm, rdata, dname, rc)
 
     !---------------
     ! Read scalar double from netcdf file
@@ -1964,7 +1860,6 @@ contains
     ! input/output arguments
     character(len=*) , intent(in)    :: filename ! file
     type(ESMF_VM)                    :: vm
-    integer          , intent(in)    :: iam
     real(r8)         , intent(inout) :: rdata    ! real data
     character(len=*) , intent(in)    :: dname    ! name of data
     integer          , intent(out)   :: rc
@@ -1975,7 +1870,7 @@ contains
     !-------------------------------------------------------------------------------
 
     rc = ESMF_SUCCESS
-    call med_io_read_r81d(filename, vm, iam, r1d,dname, rc)
+    call med_io_read_r81d(filename, vm, r1d,dname, rc)
     if (chkerr(rc,__LINE__,u_FILE_u)) return
 
     rdata = r1d(1)
@@ -1983,7 +1878,7 @@ contains
   end subroutine med_io_read_r8
 
   !===============================================================================
-  subroutine med_io_read_r81d(filename, vm, iam, rdata, dname, rc)
+  subroutine med_io_read_r81d(filename, vm, rdata, dname, rc)
 
     !---------------
     ! Read 1d double array from netcdf file
@@ -1996,7 +1891,6 @@ contains
     ! input/output arguments
     character(len=*), intent(in)    :: filename ! file
     type(ESMF_VM)                   :: vm
-    integer         , intent(in)    :: iam
     real(r8)        , intent(inout) :: rdata(:) ! real data
     character(len=*), intent(in)    :: dname    ! name of data
     integer         , intent(out)   :: rc
@@ -2007,6 +1901,7 @@ contains
     type(var_desc_t)  :: varid
     character(CL)     :: lversion
     character(CL)     :: name1
+    integer           :: iam
     character(*),parameter :: subName = '(med_io_read_r81d) '
     !-------------------------------------------------------------------------------
 
@@ -2014,15 +1909,16 @@ contains
 
     lversion=trim(version)
 
-    if (med_io_file_exists(vm, iam, filename)) then
+    call ESMF_VMGet(vm, localPet=iam, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    if (med_io_file_exists(vm, filename)) then
        rcode = pio_openfile(io_subsystem, pioid, pio_iotype, trim(filename),pio_nowrite)
        call pio_seterrorhandling(pioid,PIO_BCAST_ERROR)
        rcode = pio_get_att(pioid,pio_global,"file_version",lversion)
        call pio_seterrorhandling(pioid,PIO_INTERNAL_ERROR)
     else
-       if(iam==0) write(logunit,*) subname,' ERROR: file invalid ',trim(filename),' ',trim(dname)
-       call ESMF_LogWrite(trim(subname)//'ERROR: file invalid '//trim(filename)//' '//trim(dname), ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
+       call shr_log_error(trim(subname)//'ERROR: file invalid '//trim(filename)//' '//trim(dname), rc=rc)
        return
     endif
 
@@ -2038,7 +1934,7 @@ contains
   end subroutine med_io_read_r81d
 
   !===============================================================================
-  subroutine med_io_read_char(filename, vm, iam, rdata, dname, rc)
+  subroutine med_io_read_char(filename, vm, rdata, dname, rc)
 
     !---------------
     ! Read char string from netcdf file
@@ -2051,7 +1947,6 @@ contains
     ! input/output arguments
     character(len=*), intent(in)    :: filename ! file
     type(ESMF_VM)                   :: vm
-    integer, intent(in)             :: iam
     character(len=*), intent(inout) :: rdata    ! character data
     character(len=*), intent(in)    :: dname    ! name of data
     integer         , intent(out)   :: rc
@@ -2062,6 +1957,7 @@ contains
     type(var_desc_t)  :: varid
     character(CL)     :: lversion
     character(CL)     :: name1
+    integer           :: iam
     character(CL)     :: charvar   ! buffer for string read/write
     character(*),parameter :: subName = '(med_io_read_char) '
     !-------------------------------------------------------------------------------
@@ -2070,16 +1966,17 @@ contains
 
     lversion=trim(version)
 
-    if (med_io_file_exists(vm, iam, filename)) then
+    call ESMF_VMGet(vm, localPet=iam, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    if (med_io_file_exists(vm, filename)) then
        rcode = pio_openfile(io_subsystem, pioid, pio_iotype, trim(filename),pio_nowrite)
        ! write(logunit,*) subname,' open file ',trim(filename)
        call pio_seterrorhandling(pioid,PIO_BCAST_ERROR)
        rcode = pio_get_att(pioid,pio_global,"file_version",lversion)
        call pio_seterrorhandling(pioid,PIO_INTERNAL_ERROR)
     else
-       if(iam==0) write(logunit,*) subname,' ERROR: file invalid ',trim(filename),' ',trim(dname)
-       call ESMF_LogWrite(trim(subname)//'ERROR: file invalid '//trim(filename)//' '//trim(dname), ESMF_LOGMSG_INFO)
-       rc = ESMF_FAILURE
+       call shr_log_error(trim(subname)//'ERROR: file invalid '//trim(filename)//' '//trim(dname), rc=rc)
        return
     endif
 
@@ -2126,7 +2023,7 @@ contains
     year =int(tdate/10000)
     if (date < 0) year = -year
     month = int( mod(tdate,10000_I8)/  100)
-    day = mod(tdate,  100_I8)
+    day = int(mod(tdate,  100_I8))
   end subroutine med_io_date2ymd_long
 
   !===============================================================================

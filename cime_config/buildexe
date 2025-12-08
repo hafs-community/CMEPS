@@ -37,8 +37,8 @@ def _main_func():
         cime_model = case.get_value("MODEL")
         num_esp   = case.get_value("NUM_COMP_INST_ESP")
         ocn_model = case.get_value("COMP_OCN")
-        atm_model = case.get_value("COMP_ATM")
         gmake_args = get_standard_makefile_args(case)
+        link_libs = case.get_value("CAM_LINKED_LIBS", subgroup="build_component_cam")
         esmf_aware_threading = case.get_value("ESMF_AWARE_THREADING")
 
     # Determine valid components
@@ -63,8 +63,11 @@ def _main_func():
     else:
         skip_mediator = False
 
-    if ocn_model == 'mom' or atm_model == "ufsatm":
+    if ocn_model == 'mom':
         gmake_args += "USE_FMS=TRUE"
+
+    if link_libs is not None:
+        gmake_args += 'USER_SLIBS="{}"'.format(link_libs)
 
     comp_classes = case.get_values("COMP_CLASSES")
     for comp in comp_classes:
@@ -84,13 +87,14 @@ def _main_func():
     if not os.path.isdir(bld_root):
         os.makedirs(bld_root)
 
-    with open(os.path.join(bld_root,'Filepath'), 'w') as out:
+    with open(os.path.join(bld_root,'Filepath'), 'w', encoding="utf-8") as out:
         cmeps_dir = os.path.join(os.path.dirname(__file__), os.pardir)
         # SourceMods dir needs to be first listed
         out.write(os.path.join(caseroot, "SourceMods", "src.drv") + "\n")
         if not skip_mediator:
             out.write(os.path.join(cmeps_dir, "mediator") + "\n")
-        out.write(os.path.join(cmeps_dir, "drivers", "cime") + "\n")
+            out.write(os.path.join(cmeps_dir, "cesm", "flux_atmocn") + "\n")
+        out.write(os.path.join(cmeps_dir, "cesm", "driver") + "\n")
 
     # build model executable
     makefile = os.path.join(casetools, "Makefile")
@@ -104,13 +108,17 @@ def _main_func():
     # always relink
     if os.path.isfile(exename):
         os.remove(exename)
-
-    cmd = "{} exec_se -j {} EXEC_SE={} MODEL=driver {} -f {} "\
+    exename = os.path.relpath(exename, bld_root)
+    cmd = "{} exec_se -j {} EXEC_SE={} COMP_NAME=driver {} -f {} "\
         .format(gmake, gmake_j, exename, gmake_args, makefile)
-
+    pio = os.environ.get("PIO")
+    if pio:
+        os.environ["PIO_LIBDIR"] = os.path.join(pio,"lib")
 
     rc, out, err = run_cmd(cmd,from_dir=bld_root)
     expect(rc==0,"Command {} failed rc={}\nout={}\nerr={}".format(cmd,rc,out,err))
+    if err:
+        logger.info(err)
     logger.info(out)
 
 ###############################################################################
